@@ -3566,7 +3566,7 @@ drmmode_output_get_property(xf86OutputPtr output, Atom property)
     return TRUE;
 }
 
-static const xf86OutputFuncsRec drmmode_output_funcs = {
+const xf86OutputFuncsRec drmmode_output_funcs = {
     .dpms = drmmode_output_dpms,
     .create_resources = drmmode_output_create_resources,
     .set_property = drmmode_output_set_property,
@@ -4249,6 +4249,9 @@ drmmode_pre_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode, int cpp)
 
     drmModeFreeResources(mode_res);
     xf86ProviderSetup(pScrn, NULL, "modesetting");
+
+    /* Initialize virtual XR connector */
+    drmmode_xr_virtual_output_init(pScrn, drmmode);
 
     xf86InitialConfiguration(pScrn, TRUE);
 
