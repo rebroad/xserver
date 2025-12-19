@@ -385,61 +385,11 @@ else
 fi
 
 echo ""
-echo "=== Test 6: Verify graphics are working ==="
-echo "Testing X11 graphics capabilities..."
+echo "=== Test 6: Start XLogo on all outputs (immediate visual feedback) ==="
+echo "Starting XLogo windows on all outputs..."
+XLOGO_PIDS=""
+WM_PID=""
 
-# Test 1: Simple X11 drawing test using xdpyinfo (already verified X server works)
-if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
-    echo "✓ X server is responding to X11 protocol"
-else
-    echo "✗ X server not responding"
-fi
-
-# Test 2: Test mouse pointer movement
-echo ""
-echo "Testing mouse pointer..."
-if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
-    echo "✓ Mouse pointer cursor set"
-
-    # Try to actually move the pointer to verify it's working
-    if command -v xdotool >/dev/null 2>&1; then
-        echo "  Testing pointer movement with xdotool..."
-        # Get current position
-        OLD_POS=$(DISPLAY="$TEST_DISPLAY" xdotool getmouselocation 2>/dev/null | awk '{print $1" "$2}' | sed 's/[xy]://g')
-        if [ -n "$OLD_POS" ]; then
-            echo "  Current mouse position: $OLD_POS"
-            # Move mouse slightly
-            DISPLAY="$TEST_DISPLAY" xdotool mousemove_relative 10 10 >/dev/null 2>&1
-            sleep 0.5
-            NEW_POS=$(DISPLAY="$TEST_DISPLAY" xdotool getmouselocation 2>/dev/null | awk '{print $1" "$2}' | sed 's/[xy]://g')
-            if [ -n "$NEW_POS" ] && [ "$OLD_POS" != "$NEW_POS" ]; then
-                echo "  ✓ Mouse pointer is moveable (moved from $OLD_POS to $NEW_POS)"
-            else
-                echo "  ⚠ Mouse pointer movement test inconclusive"
-            fi
-        else
-            echo "  ⚠ Could not get mouse position"
-        fi
-    elif command -v xinput >/dev/null 2>&1; then
-        echo "  Checking pointer devices..."
-        POINTER_DEVICES=$(DISPLAY="$TEST_DISPLAY" xinput list 2>/dev/null | grep -i "pointer\|mouse" | head -2)
-        if [ -n "$POINTER_DEVICES" ]; then
-            echo "  Found pointer devices:"
-            echo "$POINTER_DEVICES" | sed 's/^/    /'
-            echo "  ✓ Pointer devices detected - move your mouse to verify it's visible"
-        else
-            echo "  ⚠ No pointer devices found"
-        fi
-    else
-        echo "  Note: xdotool/xinput not available - manually move your mouse to verify pointer is visible"
-    fi
-else
-    echo "✗ Failed to set mouse pointer"
-fi
-
-# Test 3: Put xlogo on all outputs/displays
-echo ""
-echo "Testing graphics on all outputs..."
 if command -v xlogo >/dev/null 2>&1; then
     # Get list of connected outputs with their positions
     # Format: output_name x_pos y_pos (from xrandr output like "DP-1 connected 1920x1080+1920+0")
@@ -478,7 +428,6 @@ if command -v xlogo >/dev/null 2>&1; then
             echo "  $output at ($x_pos, $y_pos)"
         done
 
-        XLOGO_PIDS=""
         echo "$OUTPUT_INFO" | while read output x_pos y_pos; do
             # Position window relative to the output's position, offset by 100,100
             win_x=$((x_pos + 100))
@@ -496,27 +445,132 @@ if command -v xlogo >/dev/null 2>&1; then
             rm -f /tmp/xlogo_pids.txt
         fi
 
-        echo "  xlogo windows running for 8 seconds (PIDs:$XLOGO_PIDS)"
-        echo "  You should see X logos on each display/output"
-        sleep 8
-
-        # Kill all xlogo processes
-        for pid in $XLOGO_PIDS; do
-            if kill -0 $pid 2>/dev/null; then
-                kill $pid 2>/dev/null || true
-                wait $pid 2>/dev/null || true
-            fi
-        done
-        echo "✓ Graphics test complete"
+        echo "✓ XLogo started on all outputs (PIDs:$XLOGO_PIDS)"
+        echo "  XLogo windows should be visible now - you can see them while tests continue"
     else
-        echo "✗ No outputs found to test"
+        echo "✗ No outputs found to start XLogo"
     fi
 else
-    echo "Note: xlogo not available, skipping graphics test"
+    echo "Note: xlogo not available, skipping XLogo test"
+fi
+
+echo ""
+echo "=== Test 7: Start window manager (for cursor visibility) ==="
+# Try to find a lightweight window manager
+WM_CMD=""
+if command -v openbox >/dev/null 2>&1; then
+    WM_CMD="openbox"
+elif command -v twm >/dev/null 2>&1; then
+    WM_CMD="twm"
+elif command -v metacity >/dev/null 2>&1; then
+    WM_CMD="metacity --replace"
+elif command -v xfwm4 >/dev/null 2>&1; then
+    WM_CMD="xfwm4 --replace"
+fi
+
+if [ -n "$WM_CMD" ]; then
+    echo "Starting window manager: $WM_CMD"
+    DISPLAY="$TEST_DISPLAY" $WM_CMD >/tmp/wm_${TEST_DISPLAY#:}.log 2>&1 &
+    WM_PID=$!
+    sleep 2  # Give WM time to start
+    if kill -0 $WM_PID 2>/dev/null; then
+        echo "✓ Window manager started (PID: $WM_PID)"
+    else
+        echo "⚠ Window manager may have exited (check /tmp/wm_${TEST_DISPLAY#:}.log)"
+        WM_PID=""
+    fi
+else
+    echo "⚠ No window manager found (tried: openbox, twm, metacity, xfwm4)"
+    echo "  Cursor may not be visible without a window manager"
+fi
+
+echo ""
+echo "=== Test 8: Test mouse pointer (with window manager) ==="
+if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
+    echo "✓ Mouse pointer cursor set"
+
+    # Try to actually move the pointer to verify it's working
+    if command -v xdotool >/dev/null 2>&1; then
+        echo "  Testing pointer movement with xdotool..."
+        # Get current position
+        OLD_POS=$(DISPLAY="$TEST_DISPLAY" xdotool getmouselocation 2>/dev/null | awk '{print $1" "$2}' | sed 's/[xy]://g')
+        if [ -n "$OLD_POS" ]; then
+            echo "  Current mouse position: $OLD_POS"
+            # Move mouse to a visible position (center of first screen)
+            DISPLAY="$TEST_DISPLAY" xdotool mousemove 960 540 >/dev/null 2>&1
+            sleep 0.3
+            # Move mouse to verify it moves
+            DISPLAY="$TEST_DISPLAY" xdotool mousemove 1000 600 >/dev/null 2>&1
+            sleep 0.3
+            NEW_POS=$(DISPLAY="$TEST_DISPLAY" xdotool getmouselocation 2>/dev/null | awk '{print $1" "$2}' | sed 's/[xy]://g')
+            if [ -n "$NEW_POS" ]; then
+                echo "  New mouse position: $NEW_POS"
+                if [ "$OLD_POS" != "$NEW_POS" ]; then
+                    echo "  ✓ Mouse pointer is moveable (moved from $OLD_POS to $NEW_POS)"
+                else
+                    echo "  ⚠ Mouse pointer position didn't change"
+                fi
+            else
+                echo "  ⚠ Could not get new mouse position"
+            fi
+        else
+            echo "  ⚠ Could not get mouse position"
+        fi
+    fi
+
+    # Check for pointer devices
+    if command -v xinput >/dev/null 2>&1; then
+        echo "  Checking pointer devices..."
+        POINTER_DEVICES=$(DISPLAY="$TEST_DISPLAY" xinput list 2>/dev/null | grep -i "pointer\|mouse\|slave" | head -5)
+        if [ -n "$POINTER_DEVICES" ]; then
+            echo "  Found pointer devices:"
+            echo "$POINTER_DEVICES" | sed 's/^/    /'
+        fi
+    fi
+
+    if [ -n "$WM_PID" ]; then
+        echo "  ✓ Window manager is running - cursor should be visible"
+        echo "  Try moving your physical mouse - you should see the pointer move on screen"
+    else
+        echo "  ⚠ No window manager - cursor may not be visible"
+    fi
+else
+    echo "✗ Failed to set mouse pointer"
+fi
+
+echo ""
+echo "=== Test 9: Verify X11 graphics capabilities ==="
+if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
+    echo "✓ X server is responding to X11 protocol"
+else
+    echo "✗ X server not responding"
+fi
+
+# Keep XLogo running for a bit longer so user can see it
+if [ -n "$XLOGO_PIDS" ]; then
+    echo ""
+    echo "XLogo windows will remain visible for 5 more seconds..."
+    sleep 5
+
+    # Kill all xlogo processes
+    for pid in $XLOGO_PIDS; do
+        if kill -0 $pid 2>/dev/null; then
+            kill $pid 2>/dev/null || true
+            wait $pid 2>/dev/null || true
+        fi
+    done
+    echo "✓ XLogo windows closed"
 fi
 
 echo ""
 echo "=== Cleanup ==="
+# Kill window manager if still running
+if [ -n "$WM_PID" ] && kill -0 $WM_PID 2>/dev/null; then
+    echo "Stopping window manager..."
+    kill $WM_PID 2>/dev/null || true
+    wait $WM_PID 2>/dev/null || true
+fi
+
 # Cleanup is handled by the trap, but we'll do it explicitly here too
 # Temporarily disable the trap to avoid double cleanup
 trap - EXIT INT TERM
