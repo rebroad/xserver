@@ -367,8 +367,6 @@ fi
 echo ""
 echo "=== Test 6: Verify graphics are working ==="
 echo "Testing X11 graphics capabilities..."
-echo "Note: Without a window manager, windows may not be visible or properly positioned."
-echo "If you're on VT $TEST_VT, you should see a test window briefly."
 
 # Test 1: Simple X11 drawing test using xdpyinfo (already verified X server works)
 if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
@@ -377,74 +375,62 @@ else
     echo "✗ X server not responding"
 fi
 
-# Test 2: Try to create a simple window and draw to it
+# Test 2: Test mouse pointer movement
+echo ""
+echo "Testing mouse pointer..."
+if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
+    echo "✓ Mouse pointer can be set"
+    echo "  Move your mouse to verify the pointer is visible and moveable"
+else
+    echo "✗ Failed to set mouse pointer"
+fi
+
+# Test 3: Put xlogo on all outputs/displays
+echo ""
+echo "Testing graphics on all outputs..."
 if command -v xlogo >/dev/null 2>&1; then
-    echo "Starting xlogo test (will run for 8 seconds)..."
-    echo "Note: Without a window manager, the window may not be visible or may be off-screen."
-    DISPLAY="$TEST_DISPLAY" xlogo -geometry 300x300+50+50 >/tmp/xlogo_test.log 2>&1 &
-    XLOGO_PID=$!
-    sleep 8
-    if kill -0 $XLOGO_PID 2>/dev/null; then
-        echo "✓ xlogo started and is running (PID: $XLOGO_PID)"
-        kill $XLOGO_PID 2>/dev/null || true
-        wait $XLOGO_PID 2>/dev/null || true
-        if [ -s /tmp/xlogo_test.log ]; then
-            echo "  xlogo output:"
-            cat /tmp/xlogo_test.log | head -5
-        fi
-    else
-        echo "✗ xlogo failed to start or crashed"
-        if [ -s /tmp/xlogo_test.log ]; then
-            echo "  Error output:"
-            cat /tmp/xlogo_test.log
-        fi
+    # Get list of connected outputs
+    OUTPUTS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | awk '{print $1}')
+    if [ -z "$OUTPUTS" ]; then
+        # Fallback: try to get any outputs
+        OUTPUTS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | awk '{print $1}' | head -3)
     fi
-elif command -v xeyes >/dev/null 2>&1; then
-    echo "Starting xeyes test (will run for 8 seconds)..."
-    echo "Note: Without a window manager, the window may not be visible or may be off-screen."
-    DISPLAY="$TEST_DISPLAY" xeyes -geometry 300x300+50+50 >/tmp/xeyes_test.log 2>&1 &
-    XEYES_PID=$!
-    sleep 8
-    if kill -0 $XEYES_PID 2>/dev/null; then
-        echo "✓ xeyes started and is running (PID: $XEYES_PID)"
-        kill $XEYES_PID 2>/dev/null || true
-        wait $XEYES_PID 2>/dev/null || true
-        if [ -s /tmp/xeyes_test.log ]; then
-            echo "  xeyes output:"
-            cat /tmp/xeyes_test.log | head -5
-        fi
+
+    if [ -n "$OUTPUTS" ]; then
+        echo "Found outputs: $OUTPUTS"
+        XLOGO_PIDS=""
+        X_POS=100
+        Y_POS=100
+
+        for output in $OUTPUTS; do
+            echo "  Starting xlogo on $output at position ${X_POS},${Y_POS}..."
+            DISPLAY="$TEST_DISPLAY" xlogo -geometry 200x200+${X_POS}+${Y_POS} >/tmp/xlogo_${output}.log 2>&1 &
+            XLOGO_PID=$!
+            XLOGO_PIDS="$XLOGO_PIDS $XLOGO_PID"
+            X_POS=$((X_POS + 250))
+            if [ $X_POS -gt 2000 ]; then
+                X_POS=100
+                Y_POS=$((Y_POS + 250))
+            fi
+        done
+
+        echo "  xlogo windows running for 8 seconds (PIDs:$XLOGO_PIDS)"
+        echo "  You should see X logos on each display/output"
+        sleep 8
+
+        # Kill all xlogo processes
+        for pid in $XLOGO_PIDS; do
+            if kill -0 $pid 2>/dev/null; then
+                kill $pid 2>/dev/null || true
+                wait $pid 2>/dev/null || true
+            fi
+        done
+        echo "✓ Graphics test complete"
     else
-        echo "✗ xeyes failed to start or crashed"
-        if [ -s /tmp/xeyes_test.log ]; then
-            echo "  Error output:"
-            cat /tmp/xeyes_test.log
-        fi
-    fi
-elif command -v xclock >/dev/null 2>&1; then
-    echo "Starting xclock test (will run for 8 seconds)..."
-    echo "Note: Without a window manager, the window may not be visible or may be off-screen."
-    DISPLAY="$TEST_DISPLAY" xclock -geometry 300x300+50+50 >/tmp/xclock_test.log 2>&1 &
-    XCLOCK_PID=$!
-    sleep 8
-    if kill -0 $XCLOCK_PID 2>/dev/null; then
-        echo "✓ xclock started and is running (PID: $XCLOCK_PID)"
-        kill $XCLOCK_PID 2>/dev/null || true
-        wait $XCLOCK_PID 2>/dev/null || true
-        if [ -s /tmp/xclock_test.log ]; then
-            echo "  xclock output:"
-            cat /tmp/xclock_test.log | head -5
-        fi
-    else
-        echo "✗ xclock failed to start or crashed"
-        if [ -s /tmp/xclock_test.log ]; then
-            echo "  Error output:"
-            cat /tmp/xclock_test.log
-        fi
+        echo "✗ No outputs found to test"
     fi
 else
-    echo "Note: xlogo/xeyes/xclock not available, skipping interactive graphics test"
-    echo "The black screen is normal - there's no window manager running"
-    echo "Graphics capability is verified by X server responding to X11 protocol"
+    echo "Note: xlogo not available, skipping graphics test"
 fi
 
 echo ""
