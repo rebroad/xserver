@@ -18,12 +18,20 @@ ORIGINAL_VT=""
 cleanup_xorg() {
     local cleanup_time=$(date +%s)
     local cleanup_reason="${1:-normal exit}"
+    local quick_exit=0
+
+    # If interrupted, exit quickly after cleanup
+    if [ "$cleanup_reason" = "interrupted (SIGINT)" ] || [ "$cleanup_reason" = "terminated (SIGTERM)" ]; then
+        quick_exit=1
+    fi
 
     # Calculate how long Xorg ran
     if [ -n "$XORG_START_TIME" ]; then
         local xorg_duration=$((cleanup_time - XORG_START_TIME))
-        echo ""
-        echo "=== Xorg Lifecycle Summary ==="
+        if [ $quick_exit -eq 0 ]; then
+            echo ""
+            echo "=== Xorg Lifecycle Summary ==="
+        fi
         echo "Xorg started at: $(date -d "@$XORG_START_TIME" '+%Y-%m-%d %H:%M:%S')"
         echo "Xorg ran for: ${xorg_duration} seconds"
         echo "Cleanup reason: $cleanup_reason"
@@ -34,12 +42,16 @@ cleanup_xorg() {
     local force_killed=0
 
     if [ -n "$XORG_PID" ] && kill -0 "$XORG_PID" 2>/dev/null; then
-        echo ""
-        echo "=== Cleanup: Killing Xorg (PID: $XORG_PID) ==="
+        if [ $quick_exit -eq 0 ]; then
+            echo ""
+            echo "=== Cleanup: Killing Xorg (PID: $XORG_PID) ==="
+        fi
         sudo kill "$XORG_PID" 2>/dev/null || true
-        sleep 1
+        sleep 0.5
         if kill -0 "$XORG_PID" 2>/dev/null; then
-            echo "Force killing Xorg (PID: $XORG_PID)..."
+            if [ $quick_exit -eq 0 ]; then
+                echo "Force killing Xorg (PID: $XORG_PID)..."
+            fi
             sudo kill -9 "$XORG_PID" 2>/dev/null || true
             force_killed=1
         fi
@@ -49,11 +61,15 @@ cleanup_xorg() {
     # Also kill by display socket to be extra sure
     XORG_PID_ON_DISPLAY=$(lsof -t "/tmp/.X11-unix/X${TEST_DISPLAY#:}" 2>/dev/null || true)
     if [ -n "$XORG_PID_ON_DISPLAY" ] && [ "$XORG_PID_ON_DISPLAY" != "$XORG_PID" ]; then
-        echo "Killing Xorg on display $TEST_DISPLAY (PID: $XORG_PID_ON_DISPLAY)..."
+        if [ $quick_exit -eq 0 ]; then
+            echo "Killing Xorg on display $TEST_DISPLAY (PID: $XORG_PID_ON_DISPLAY)..."
+        fi
         sudo kill "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
-        sleep 1
+        sleep 0.5
         if kill -0 "$XORG_PID_ON_DISPLAY" 2>/dev/null; then
-            echo "Force killing Xorg (PID: $XORG_PID_ON_DISPLAY)..."
+            if [ $quick_exit -eq 0 ]; then
+                echo "Force killing Xorg (PID: $XORG_PID_ON_DISPLAY)..."
+            fi
             sudo kill -9 "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
             force_killed=1
         fi
@@ -61,17 +77,21 @@ cleanup_xorg() {
     fi
 
     # Verify it's really dead
-    sleep 1
+    sleep 0.5
     if lsof "/tmp/.X11-unix/X${TEST_DISPLAY#:}" >/dev/null 2>&1; then
-        echo "WARNING: Xorg socket still exists, trying one more time..."
+        if [ $quick_exit -eq 0 ]; then
+            echo "WARNING: Xorg socket still exists, trying one more time..."
+        fi
         # Find and kill ONLY the Xorg process using this specific display
         FINAL_PID=$(lsof -t "/tmp/.X11-unix/X${TEST_DISPLAY#:}" 2>/dev/null || true)
         if [ -n "$FINAL_PID" ]; then
-            echo "Killing remaining Xorg process (PID: $FINAL_PID) on display $TEST_DISPLAY..."
+            if [ $quick_exit -eq 0 ]; then
+                echo "Killing remaining Xorg process (PID: $FINAL_PID) on display $TEST_DISPLAY..."
+            fi
             sudo kill -9 "$FINAL_PID" 2>/dev/null || true
             force_killed=1
         fi
-        sleep 1
+        sleep 0.5
     fi
 
     # Final verification
@@ -79,20 +99,29 @@ cleanup_xorg() {
     local cleanup_duration=$((cleanup_end_time - cleanup_time))
 
     if lsof "/tmp/.X11-unix/X${TEST_DISPLAY#:}" >/dev/null 2>&1; then
-        echo "ERROR: Xorg cleanup FAILED - socket still exists after ${cleanup_duration} seconds!"
-        echo "You may need to manually kill Xorg on display $TEST_DISPLAY"
-        echo "Run: sudo kill \$(lsof -t /tmp/.X11-unix/X${TEST_DISPLAY#:})"
+        if [ $quick_exit -eq 0 ]; then
+            echo "ERROR: Xorg cleanup FAILED - socket still exists after ${cleanup_duration} seconds!"
+            echo "You may need to manually kill Xorg on display $TEST_DISPLAY"
+            echo "Run: sudo kill \$(lsof -t /tmp/.X11-unix/X${TEST_DISPLAY#:})"
+        fi
     else
-        echo "✓ Xorg cleanup successful (took ${cleanup_duration} seconds)"
-        if [ $killed_by_pid -eq 1 ]; then
-            echo "  - Killed by PID"
+        if [ $quick_exit -eq 0 ]; then
+            echo "✓ Xorg cleanup successful (took ${cleanup_duration} seconds)"
+            if [ $killed_by_pid -eq 1 ]; then
+                echo "  - Killed by PID"
+            fi
+            if [ $killed_by_socket -eq 1 ]; then
+                echo "  - Killed by display socket"
+            fi
+            if [ $force_killed -eq 1 ]; then
+                echo "  - Required force kill (-9)"
+            fi
         fi
-        if [ $killed_by_socket -eq 1 ]; then
-            echo "  - Killed by display socket"
-        fi
-        if [ $force_killed -eq 1 ]; then
-            echo "  - Required force kill (-9)"
-        fi
+    fi
+
+    # Exit immediately if interrupted
+    if [ $quick_exit -eq 1 ]; then
+        exit 130  # Standard exit code for SIGINT
     fi
 }
 
@@ -124,20 +153,6 @@ if [ -n "$RUNNING_XORG" ]; then
     echo ""
 fi
 
-echo "WARNING: This will start Xorg on display $TEST_DISPLAY (VT $TEST_VT)"
-echo "Make sure display $TEST_DISPLAY is not in use!"
-echo ""
-read -p "Press Enter to continue or Ctrl+C to cancel..."
-
-# Ensure sudo password is cached before we need it
-echo "Checking sudo access..."
-if ! sudo -v; then
-    echo "ERROR: Failed to authenticate with sudo. Exiting."
-    exit 1
-fi
-echo "✓ Sudo access confirmed"
-echo ""
-
 # Build Xorg and required modules if not already built
 if [ ! -f "$BUILD_DIR/hw/xfree86/Xorg" ]; then
     echo "Building Xorg..."
@@ -159,24 +174,33 @@ fi
 # This allows Xorg to find both drivers (in drivers/) and other modules (in dixmods/, etc.)
 TEST_DRIVER_DIR="$BUILD_DIR/hw/xfree86"
 
-# Check if driver needs to be rebuilt (source is newer than built driver)
+# Check if driver or related files need to be rebuilt (source is newer than built driver)
 DRIVER_SRC="$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_xr_virtual.c"
 DRIVER_BUILD="$BUILD_DIR/hw/xfree86/drivers/modesetting/modesetting_drv.so"
+RANDR_SRC="$XSRC_DIR/hw/xfree86/modes/xf86RandR12.c"
+
+NEEDS_REBUILD=0
 
 if [ ! -f "$DRIVER_BUILD" ]; then
     echo "Driver not found, building..."
-    cd "$XSRC_DIR"
-    ninja -C build hw/xfree86/drivers/modesetting/modesetting_drv.so
+    NEEDS_REBUILD=1
 elif [ -f "$DRIVER_SRC" ] && [ "$DRIVER_SRC" -nt "$DRIVER_BUILD" ]; then
-    echo "Driver source is newer than built driver, rebuilding..."
-    cd "$XSRC_DIR"
-    ninja -C build hw/xfree86/drivers/modesetting/modesetting_drv.so
+    echo "Driver source (drmmode_xr_virtual.c) is newer than built driver, rebuilding..."
+    NEEDS_REBUILD=1
+elif [ -f "$RANDR_SRC" ] && [ "$RANDR_SRC" -nt "$DRIVER_BUILD" ]; then
+    echo "RandR source (xf86RandR12.c) is newer than built driver, rebuilding..."
+    NEEDS_REBUILD=1
 elif [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/driver.c" -nt "$DRIVER_BUILD" ] 2>/dev/null || \
      [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_display.c" -nt "$DRIVER_BUILD" ] 2>/dev/null || \
      [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_display.h" -nt "$DRIVER_BUILD" ] 2>/dev/null; then
     echo "Driver source files are newer than built driver, rebuilding..."
+    NEEDS_REBUILD=1
+fi
+
+if [ $NEEDS_REBUILD -eq 1 ]; then
     cd "$XSRC_DIR"
-    ninja -C build hw/xfree86/drivers/modesetting/modesetting_drv.so
+    # Rebuild both the driver and Xorg (since xf86RandR12.c is part of Xorg)
+    ninja -C build hw/xfree86/drivers/modesetting/modesetting_drv.so hw/xfree86/Xorg
 fi
 
 # Verify the driver exists after potential rebuild
@@ -189,6 +213,22 @@ fi
 echo "✓ Using driver directly from build directory"
 echo "  Driver: $BUILD_DIR/hw/xfree86/drivers/modesetting/modesetting_drv.so"
 echo "  Module path: $TEST_DRIVER_DIR"
+echo ""
+
+# Ensure sudo password is cached before we need it (needed for Xorg startup)
+echo "Checking sudo access..."
+if ! sudo -v; then
+    echo "ERROR: Failed to authenticate with sudo. Exiting."
+    exit 1
+fi
+echo "✓ Sudo access confirmed"
+echo ""
+
+echo "WARNING: This will start Xorg on display $TEST_DISPLAY (VT $TEST_VT)"
+echo "Make sure display $TEST_DISPLAY is not in use!"
+echo ""
+read -p "Press Enter to continue or Ctrl+C to cancel..."
+echo ""
 
 # Check if display is already in use
 if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
@@ -246,6 +286,16 @@ Section "Device"
     Driver "modesetting"
     Option "AccelMethod" "none"
 EndSection
+
+Section "ServerFlags"
+    # Allow Xorg to auto-detect input devices via udev/libinput
+    # Note: Physical input devices may not be available if already grabbed by
+    # the main X server on :0. The test will still work using xdotool (XTEST).
+    Option "AutoAddDevices" "true"
+    Option "AutoEnableDevices" "true"
+    # Don't fail if input devices can't be opened (they may be grabbed by :0)
+    Option "DontZap" "false"
+EndSection
 EOF
 
 # Start Xorg with our driver on a separate VT
@@ -286,6 +336,7 @@ sudo env LD_LIBRARY_PATH="$BUILD_DIR:$LD_LIBRARY_PATH" \
     -verbose 7 \
     -nolisten tcp \
     -novtswitch \
+    -allowMouseOpenFail \
     vt$TEST_VT \
     > /tmp/Xorg_startup.log 2>&1 &
 XORG_PID=$!
@@ -329,6 +380,56 @@ if [ $XORG_STARTED -eq 0 ]; then
 fi
 
 echo "Xorg started (PID: $XORG_PID)"
+echo ""
+
+# Start XLogo immediately for visual feedback (before running other tests)
+XLOGO_PIDS=""
+WM_PID=""
+if command -v xlogo >/dev/null 2>&1; then
+    echo "Starting XLogo immediately for visual feedback..."
+    # Wait a moment for Xorg to fully initialize outputs
+    sleep 1
+
+    # Get list of connected outputs with their positions
+    OUTPUT_INFO=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | awk '{
+        output=$1
+        match($0, /\+[0-9]+\+[0-9]+/)
+        if (RSTART > 0) {
+            pos=substr($0, RSTART+1, RLENGTH-1)
+            split(pos, coords, "+")
+            x=coords[1]
+            y=coords[2]
+            print output " " x " " y
+        } else {
+            print output " 0 0"
+        }
+    }')
+
+    if [ -z "$OUTPUT_INFO" ]; then
+        OUTPUTS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | awk '{print $1}' | head -3)
+        if [ -n "$OUTPUTS" ]; then
+            OUTPUT_INFO=""
+            for output in $OUTPUTS; do
+                OUTPUT_INFO="$OUTPUT_INFO $output 0 0"
+            done
+        fi
+    fi
+
+    if [ -n "$OUTPUT_INFO" ]; then
+        echo "$OUTPUT_INFO" | while read output x_pos y_pos; do
+            win_x=$((x_pos + 100))
+            win_y=$((y_pos + 100))
+            DISPLAY="$TEST_DISPLAY" xlogo -geometry 200x200+${win_x}+${win_y} >/tmp/xlogo_${output}.log 2>&1 &
+            echo $! >> /tmp/xlogo_pids.txt
+        done
+
+        if [ -f /tmp/xlogo_pids.txt ]; then
+            XLOGO_PIDS=$(cat /tmp/xlogo_pids.txt | tr '\n' ' ')
+            rm -f /tmp/xlogo_pids.txt
+        fi
+        echo "✓ XLogo started (PIDs:$XLOGO_PIDS) - windows should be visible now"
+    fi
+fi
 echo ""
 
 # Test 1: Check if XR-0 appears in xrandr
@@ -385,77 +486,7 @@ else
 fi
 
 echo ""
-echo "=== Test 6: Start XLogo on all outputs (immediate visual feedback) ==="
-echo "Starting XLogo windows on all outputs..."
-XLOGO_PIDS=""
-WM_PID=""
-
-if command -v xlogo >/dev/null 2>&1; then
-    # Get list of connected outputs with their positions
-    # Format: output_name x_pos y_pos (from xrandr output like "DP-1 connected 1920x1080+1920+0")
-    OUTPUT_INFO=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | awk '{
-        # Extract output name, resolution, and position
-        # Example: "DP-1 connected 1920x1080+1920+0 (normal left inverted right x axis y axis) 1600mm x 900mm"
-        output=$1
-        # Find the position (format: +X+Y)
-        match($0, /\+[0-9]+\+[0-9]+/)
-        if (RSTART > 0) {
-            pos=substr($0, RSTART+1, RLENGTH-1)
-            split(pos, coords, "+")
-            x=coords[1]
-            y=coords[2]
-            print output " " x " " y
-        } else {
-            # No position found, assume 0,0
-            print output " 0 0"
-        }
-    }')
-
-    if [ -z "$OUTPUT_INFO" ]; then
-        # Fallback: try to get any outputs without position info
-        OUTPUTS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | awk '{print $1}' | head -3)
-        if [ -n "$OUTPUTS" ]; then
-            OUTPUT_INFO=""
-            for output in $OUTPUTS; do
-                OUTPUT_INFO="$OUTPUT_INFO $output 0 0"
-            done
-        fi
-    fi
-
-    if [ -n "$OUTPUT_INFO" ]; then
-        echo "Found outputs with positions:"
-        echo "$OUTPUT_INFO" | while read output x_pos y_pos; do
-            echo "  $output at ($x_pos, $y_pos)"
-        done
-
-        echo "$OUTPUT_INFO" | while read output x_pos y_pos; do
-            # Position window relative to the output's position, offset by 100,100
-            win_x=$((x_pos + 100))
-            win_y=$((y_pos + 100))
-            echo "  Starting xlogo on $output at screen position ${win_x},${win_y}..."
-            DISPLAY="$TEST_DISPLAY" xlogo -geometry 200x200+${win_x}+${win_y} >/tmp/xlogo_${output}.log 2>&1 &
-            XLOGO_PID=$!
-            XLOGO_PIDS="$XLOGO_PIDS $XLOGO_PID"
-            echo "$XLOGO_PID" >> /tmp/xlogo_pids.txt
-        done
-
-        # Read PIDs from temp file (since while loop runs in subshell)
-        if [ -f /tmp/xlogo_pids.txt ]; then
-            XLOGO_PIDS=$(cat /tmp/xlogo_pids.txt | tr '\n' ' ')
-            rm -f /tmp/xlogo_pids.txt
-        fi
-
-        echo "✓ XLogo started on all outputs (PIDs:$XLOGO_PIDS)"
-        echo "  XLogo windows should be visible now - you can see them while tests continue"
-    else
-        echo "✗ No outputs found to start XLogo"
-    fi
-else
-    echo "Note: xlogo not available, skipping XLogo test"
-fi
-
-echo ""
-echo "=== Test 7: Start window manager (for cursor visibility) ==="
+echo "=== Test 6: Start window manager (for cursor visibility) ==="
 # Try to find a lightweight window manager
 WM_CMD=""
 if command -v openbox >/dev/null 2>&1; then
@@ -485,7 +516,7 @@ else
 fi
 
 echo ""
-echo "=== Test 8: Test mouse pointer (with window manager) ==="
+echo "=== Test 7: Test mouse pointer (with window manager) ==="
 if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
     echo "✓ Mouse pointer cursor set"
 
@@ -530,7 +561,12 @@ if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
 
     if [ -n "$WM_PID" ]; then
         echo "  ✓ Window manager is running - cursor should be visible"
-        echo "  Try moving your physical mouse - you should see the pointer move on screen"
+        echo ""
+        echo "  ⚠ PHYSICAL MOUSE/TOUCHPAD WON'T WORK:"
+        echo "     The main X server on :0 has already grabbed your input devices."
+        echo "     This is EXPECTED and SAFE - the test X server won't interfere with"
+        echo "     your main session. Only xdotool (XTEST) mouse movement works."
+        echo "     To test with physical mouse, you'd need to stop the main X server first."
     else
         echo "  ⚠ No window manager - cursor may not be visible"
     fi
@@ -539,7 +575,7 @@ else
 fi
 
 echo ""
-echo "=== Test 9: Verify X11 graphics capabilities ==="
+echo "=== Test 8: Verify X11 graphics capabilities ==="
 if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
     echo "✓ X server is responding to X11 protocol"
 else
