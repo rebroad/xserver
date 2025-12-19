@@ -248,9 +248,12 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
 {
     modesettingPtr ms = modesettingPTR(pScrn);
     xf86OutputPtr output = ms->xr_virtual_output;
+    static RROutputPtr last_randr_output = NULL;
+    static int call_count = 0;
 
+    call_count++;
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "drmmode_xr_virtual_output_post_screen_init: called\n");
+               "drmmode_xr_virtual_output_post_screen_init: called (call #%d)\n", call_count);
 
     if (!output) {
         xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
@@ -259,12 +262,23 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
     }
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "drmmode_xr_virtual_output_post_screen_init: output found, randr_output=%p\n",
-               output->randr_output);
+               "drmmode_xr_virtual_output_post_screen_init: output found, randr_output=%p (was %p)\n",
+               output->randr_output, last_randr_output);
 
     /* If RandR output already exists (created by xf86RandR12CreateObjects12),
      * we still need to set up the AR_MODE property and modes */
     if (output->randr_output) {
+        /* Check if this is the same output or a new one */
+        if (output->randr_output == last_randr_output) {
+            xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                       "Same RandR output, property should already exist\n");
+        } else {
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                       "RandR output changed! Old: %p, New: %p (property may be lost)\n",
+                       last_randr_output, output->randr_output);
+            last_randr_output = output->randr_output;
+        }
+
         /* Make sure modes are set */
         drmmode_xr_virtual_set_modes(output);
 
@@ -285,6 +299,10 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
                    "Failed to create RandR output for virtual XR\n");
         return FALSE;
     }
+
+    last_randr_output = output->randr_output;
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "Created new RandR output: %p\n", output->randr_output);
 
     /* Create AR_MODE property */
     drmmode_xr_virtual_ensure_ar_mode_property(pScrn, output->randr_output);
