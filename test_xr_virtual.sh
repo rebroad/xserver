@@ -174,6 +174,11 @@ fi
 # This allows Xorg to find both drivers (in drivers/) and other modules (in dixmods/, etc.)
 TEST_DRIVER_DIR="$BUILD_DIR/hw/xfree86"
 
+# Path for built libinput driver (needs to match built Xorg's ABI)
+LIBINPUT_SRC_DIR="$XSRC_DIR/../xf86-input-libinput"
+LIBINPUT_BUILD_DIR="$LIBINPUT_SRC_DIR/build"
+LIBINPUT_DRIVER="$LIBINPUT_BUILD_DIR/libinput_drv.so"
+
 # Check if driver or related files need to be rebuilt (source is newer than built driver)
 DRIVER_SRC="$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_xr_virtual.c"
 DRIVER_BUILD="$BUILD_DIR/hw/xfree86/drivers/modesetting/modesetting_drv.so"
@@ -182,6 +187,16 @@ XORG_BIN="$BUILD_DIR/hw/xfree86/Xorg"
 
 NEEDS_DRIVER_REBUILD=0
 NEEDS_XORG_REBUILD=0
+NEEDS_LIBINPUT_REBUILD=0
+
+# Check if libinput driver needs to be built
+# Only rebuild if it doesn't exist - the ABI version is fixed at compile time,
+# so if libinput was built against the current Xorg ABI, it will continue to work
+# even if Xorg is rebuilt (as long as the ABI hasn't changed)
+if [ ! -f "$LIBINPUT_DRIVER" ]; then
+    echo "libinput driver not found, will build it..."
+    NEEDS_LIBINPUT_REBUILD=1
+fi
 
 # Check if driver needs rebuilding
 if [ ! -f "$DRIVER_BUILD" ]; then
@@ -201,6 +216,116 @@ fi
 if [ -f "$RANDR_SRC" ] && [ -f "$XORG_BIN" ] && [ "$RANDR_SRC" -nt "$XORG_BIN" ]; then
     echo "RandR source (xf86RandR12.c) is newer than built Xorg, rebuilding Xorg..."
     NEEDS_XORG_REBUILD=1
+fi
+
+# Build libinput driver if needed
+if [ $NEEDS_LIBINPUT_REBUILD -eq 1 ]; then
+    echo "Building xf86-input-libinput to match built Xorg's ABI..."
+
+    # Clone if not exists
+    if [ ! -d "$LIBINPUT_SRC_DIR" ]; then
+        echo "Cloning xf86-input-libinput..."
+        cd "$XSRC_DIR/.."
+        git clone https://gitlab.freedesktop.org/xorg/driver/xf86-input-libinput.git || {
+            echo "ERROR: Failed to clone xf86-input-libinput"
+            echo "       Make sure you have git and network access"
+            exit 1
+        }
+    fi
+
+    # Build libinput driver
+    cd "$LIBINPUT_SRC_DIR"
+    # Always reconfigure to ensure correct include paths
+    # Remove build directory if it exists to force fresh configuration
+    if [ -d "$LIBINPUT_BUILD_DIR" ]; then
+        echo "Removing existing build directory to reconfigure with correct include paths..."
+        rm -rf "$LIBINPUT_BUILD_DIR"
+    fi
+
+    echo "Configuring xf86-input-libinput build..."
+    # Use PKG_CONFIG_PATH to point to our built Xorg's pkg-config file
+    # This ensures xf86-input-libinput builds against our Xorg with matching ABI
+    # Extract include directories dynamically from the X server build system
+    export PKG_CONFIG_PATH="$BUILD_DIR:$PKG_CONFIG_PATH"
+
+    # Extract include directories from the actual X server build command
+    # This ensures we use the same include paths as the modesetting driver
+    # No hardcoding - dynamically extracts from the build system
+    echo "Extracting include directories from X server build..."
+    XSERVER_INC_ARGS="-I$BUILD_DIR/include"
+    cd "$XSRC_DIR"
+    DRIVER_DIR="$XSRC_DIR/hw/xfree86/drivers/modesetting"
+
+    # Get build command and extract all -I flags
+    # Use process substitution to avoid subshell issues
+    while read inc_flag; do
+        inc_path="${inc_flag#-I}"
+
+        # Skip system paths and build artifact paths
+        if [[ "$inc_path" == /usr/* ]] || [[ "$inc_path" == *modesetting_drv.so.p* ]]; then
+            continue
+        fi
+
+        # Convert relative paths to absolute (no hardcoded directory names)
+        if [[ "$inc_path" == ../* ]]; then
+            # ../something -> $XSRC_DIR/something
+            abs_path="$XSRC_DIR/${inc_path#../}"
+        elif [[ "$inc_path" == . ]]; then
+            # Current directory -> driver dir
+            abs_path="$DRIVER_DIR"
+        elif [[ "$inc_path" == .. ]]; then
+            # Parent directory -> hw/xfree86
+            abs_path="$XSRC_DIR/hw/xfree86"
+        elif [[ "$inc_path" != /* ]]; then
+            # Relative path - try driver dir first, then source root
+            if [ -d "$DRIVER_DIR/$inc_path" ]; then
+                abs_path="$DRIVER_DIR/$inc_path"
+            else
+                abs_path="$XSRC_DIR/$inc_path"
+            fi
+        else
+            # Already absolute (but not system path)
+            abs_path="$inc_path"
+        fi
+
+        # Only add if directory exists and not already added
+        if [ -d "$abs_path" ] && [[ ! "$XSERVER_INC_ARGS" =~ "-I$abs_path" ]]; then
+            XSERVER_INC_ARGS="$XSERVER_INC_ARGS,-I$abs_path"
+        fi
+    done < <(ninja -C build -t commands hw/xfree86/drivers/modesetting/modesetting_drv.so 2>/dev/null | \
+        head -1 | grep -o "\-I[^ ]*")
+    cd "$LIBINPUT_SRC_DIR"
+
+    # Convert comma-separated string to meson array format: ['-Ipath1', '-Ipath2', ...]
+    MESON_C_ARGS=$(echo "$XSERVER_INC_ARGS" | sed "s/,/','/g" | sed "s/^/['/" | sed "s/$/']/")
+
+    meson setup build \
+        --prefix="$LIBINPUT_BUILD_DIR/install" \
+        -Dc_args="$MESON_C_ARGS" \
+        || {
+        echo "ERROR: Failed to configure xf86-input-libinput"
+        echo ""
+        echo "Missing dependencies. Please install:"
+        echo "  sudo apt-get install meson ninja-build libinput-dev libinput-tools"
+        echo ""
+        echo "To check if libinput is available:"
+        echo "  pkg-config --exists libinput && echo 'libinput found' || echo 'libinput missing'"
+        exit 1
+    }
+    unset PKG_CONFIG_PATH
+
+    echo "Building xf86-input-libinput..."
+    ninja -C build || {
+        echo "ERROR: Failed to build xf86-input-libinput"
+        exit 1
+    }
+
+    if [ ! -f "$LIBINPUT_DRIVER" ]; then
+        echo "ERROR: Built libinput driver not found at $LIBINPUT_DRIVER"
+        exit 1
+    fi
+
+    echo "✓ Built libinput driver: $LIBINPUT_DRIVER"
 fi
 
 # Rebuild what's needed
@@ -300,13 +425,33 @@ Section "Device"
 EndSection
 
 Section "ServerFlags"
-    # Allow Xorg to auto-detect input devices via udev/libinput
-    # Note: Physical input devices may not be available if already grabbed by
-    # the main X server on :0. The test will still work using xdotool (XTEST).
+    # Allow Xorg to auto-detect input devices via udev (same as system Xorg)
     Option "AutoAddDevices" "true"
     Option "AutoEnableDevices" "true"
-    # Don't fail if input devices can't be opened (they may be grabbed by :0)
     Option "DontZap" "false"
+EndSection
+
+# Match system Xorg's libinput configuration
+# The script will automatically build xf86-input-libinput to match built Xorg's ABI
+Section "InputClass"
+    Identifier "libinput keyboard catchall"
+    MatchIsKeyboard "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput pointer catchall"
+    MatchIsPointer "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput touchpad catchall"
+    MatchIsTouchpad "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
 EndSection
 EOF
 
@@ -321,14 +466,16 @@ echo "Starting Xorg (this requires sudo)..."
 echo "Module path: $TEST_DRIVER_DIR"
 echo "Build lib path: $BUILD_DIR"
 
-# Try using system Xorg first (more compatible), fall back to built Xorg
-XORG_BIN="/usr/bin/Xorg"
-if [ ! -f "$XORG_BIN" ] || ! "$XORG_BIN" -version >/dev/null 2>&1; then
-    XORG_BIN="$BUILD_DIR/hw/xfree86/Xorg"
-    echo "Using built Xorg: $XORG_BIN"
-else
-    echo "Using system Xorg: $XORG_BIN"
+# We MUST use built Xorg because we modified xf86RandR12.c
+# However, system libinput has ABI version 24 while built Xorg expects 25
+# We'll try to use evdev instead, or document that libinput needs to be built from source
+XORG_BIN="$BUILD_DIR/hw/xfree86/Xorg"
+if [ ! -f "$XORG_BIN" ]; then
+    echo "ERROR: Built Xorg not found at $XORG_BIN"
+    echo "       Run 'ninja -C build' to build Xorg"
+    exit 1
 fi
+echo "Using built Xorg: $XORG_BIN (required for our xf86RandR12.c changes)"
 
 # Try to get more detailed error information
 # The "failed to map segment" error is often due to:
@@ -340,10 +487,29 @@ fi
 # IMPORTANT: Use -novtswitch to prevent this X server from switching VTs
 # This should prevent it from interfering with the running X server on VT7
 # Start Xorg in background - we'll monitor it and kill it if it hangs
+# Include built libinput driver directory (matches built Xorg's ABI)
+# Xorg looks in subdirectories (drivers/, input/, etc.) within the module path
+# NOTE: ModulePath uses COMMA as separator, not colon!
+if [ -f "$LIBINPUT_DRIVER" ]; then
+    # Use built libinput driver (ABI matches built Xorg)
+    LIBINPUT_MODULE_DIR="$(dirname "$LIBINPUT_DRIVER")"
+    MODULE_PATH="$TEST_DRIVER_DIR,$LIBINPUT_MODULE_DIR"
+    echo "Using built libinput driver: $LIBINPUT_DRIVER"
+else
+    # Fallback to system modules (will have ABI mismatch, but at least Xorg will start)
+    SYSTEM_MODULES="/usr/lib/xorg/modules"
+    if [ -d "$SYSTEM_MODULES" ]; then
+        MODULE_PATH="$TEST_DRIVER_DIR,$SYSTEM_MODULES"
+        echo "WARNING: Using system libinput (ABI mismatch expected)"
+    else
+        MODULE_PATH="$TEST_DRIVER_DIR"
+    fi
+fi
+
 sudo env LD_LIBRARY_PATH="$BUILD_DIR:$LD_LIBRARY_PATH" \
     "$XORG_BIN" "$TEST_DISPLAY" \
     -config /tmp/test-xorg.conf \
-    -modulepath "$TEST_DRIVER_DIR" \
+    -modulepath "$MODULE_PATH" \
     -logfile "$TEST_LOG" \
     -verbose 7 \
     -nolisten tcp \
@@ -601,11 +767,9 @@ if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
     if [ -n "$WM_PID" ]; then
         echo "  ✓ Window manager is running - cursor should be visible"
         echo ""
-        echo "  ⚠ PHYSICAL MOUSE/TOUCHPAD WON'T WORK:"
-        echo "     The main X server on :0 has already grabbed your input devices."
-        echo "     This is EXPECTED and SAFE - the test X server won't interfere with"
-        echo "     your main session. Only xdotool (XTEST) mouse movement works."
-        echo "     To test with physical mouse, you'd need to stop the main X server first."
+        echo "  Note: Physical mouse/touchpad should work when you switch to VT $TEST_VT."
+        echo "        Input devices are shared between VTs - the active VT gets input."
+        echo "        If mouse doesn't work, check Xorg log for input device errors."
     else
         echo "  ⚠ No window manager - cursor may not be visible"
     fi
