@@ -10,6 +10,95 @@ BUILD_DIR="$XSRC_DIR/build"
 TEST_DISPLAY=":1"
 TEST_LOG="/tmp/Xorg_test.log"
 TEST_VT="8"
+XORG_PID=""
+XORG_START_TIME=""
+
+# Cleanup function to ensure Xorg is always killed
+cleanup_xorg() {
+    local cleanup_time=$(date +%s)
+    local cleanup_reason="${1:-normal exit}"
+
+    # Calculate how long Xorg ran
+    if [ -n "$XORG_START_TIME" ]; then
+        local xorg_duration=$((cleanup_time - XORG_START_TIME))
+        echo ""
+        echo "=== Xorg Lifecycle Summary ==="
+        echo "Xorg started at: $(date -d "@$XORG_START_TIME" '+%Y-%m-%d %H:%M:%S')"
+        echo "Xorg ran for: ${xorg_duration} seconds"
+        echo "Cleanup reason: $cleanup_reason"
+    fi
+
+    local killed_by_pid=0
+    local killed_by_socket=0
+    local force_killed=0
+
+    if [ -n "$XORG_PID" ] && kill -0 "$XORG_PID" 2>/dev/null; then
+        echo ""
+        echo "=== Cleanup: Killing Xorg (PID: $XORG_PID) ==="
+        sudo kill "$XORG_PID" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$XORG_PID" 2>/dev/null; then
+            echo "Force killing Xorg (PID: $XORG_PID)..."
+            sudo kill -9 "$XORG_PID" 2>/dev/null || true
+            force_killed=1
+        fi
+        killed_by_pid=1
+    fi
+
+    # Also kill by display socket to be extra sure
+    XORG_PID_ON_DISPLAY=$(lsof -t "/tmp/.X11-unix/X${TEST_DISPLAY#:}" 2>/dev/null || true)
+    if [ -n "$XORG_PID_ON_DISPLAY" ] && [ "$XORG_PID_ON_DISPLAY" != "$XORG_PID" ]; then
+        echo "Killing Xorg on display $TEST_DISPLAY (PID: $XORG_PID_ON_DISPLAY)..."
+        sudo kill "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$XORG_PID_ON_DISPLAY" 2>/dev/null; then
+            echo "Force killing Xorg (PID: $XORG_PID_ON_DISPLAY)..."
+            sudo kill -9 "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
+            force_killed=1
+        fi
+        killed_by_socket=1
+    fi
+
+    # Verify it's really dead
+    sleep 1
+    if lsof "/tmp/.X11-unix/X${TEST_DISPLAY#:}" >/dev/null 2>&1; then
+        echo "WARNING: Xorg socket still exists, trying one more time..."
+        # Find and kill ONLY the Xorg process using this specific display
+        FINAL_PID=$(lsof -t "/tmp/.X11-unix/X${TEST_DISPLAY#:}" 2>/dev/null || true)
+        if [ -n "$FINAL_PID" ]; then
+            echo "Killing remaining Xorg process (PID: $FINAL_PID) on display $TEST_DISPLAY..."
+            sudo kill -9 "$FINAL_PID" 2>/dev/null || true
+            force_killed=1
+        fi
+        sleep 1
+    fi
+
+    # Final verification
+    local cleanup_end_time=$(date +%s)
+    local cleanup_duration=$((cleanup_end_time - cleanup_time))
+
+    if lsof "/tmp/.X11-unix/X${TEST_DISPLAY#:}" >/dev/null 2>&1; then
+        echo "ERROR: Xorg cleanup FAILED - socket still exists after ${cleanup_duration} seconds!"
+        echo "You may need to manually kill Xorg on display $TEST_DISPLAY"
+        echo "Run: sudo kill \$(lsof -t /tmp/.X11-unix/X${TEST_DISPLAY#:})"
+    else
+        echo "✓ Xorg cleanup successful (took ${cleanup_duration} seconds)"
+        if [ $killed_by_pid -eq 1 ]; then
+            echo "  - Killed by PID"
+        fi
+        if [ $killed_by_socket -eq 1 ]; then
+            echo "  - Killed by display socket"
+        fi
+        if [ $force_killed -eq 1 ]; then
+            echo "  - Required force kill (-9)"
+        fi
+    fi
+}
+
+# Set up trap to ensure cleanup happens on exit
+trap 'cleanup_xorg "script exit (trap)"' EXIT
+trap 'cleanup_xorg "interrupted (SIGINT)"' INT
+trap 'cleanup_xorg "terminated (SIGTERM)"' TERM
 
 echo "=== Testing Virtual XR Connector ==="
 echo ""
@@ -191,6 +280,7 @@ sudo env LD_LIBRARY_PATH="$BUILD_DIR:$LD_LIBRARY_PATH" \
     vt$TEST_VT \
     > /tmp/Xorg_startup.log 2>&1 &
 XORG_PID=$!
+XORG_START_TIME=$(date +%s)
 
 # Wait for Xorg to start (check if process is still running)
 echo "Waiting for Xorg to start (max 15 seconds)..."
@@ -216,7 +306,7 @@ for i in {1..15}; do
     if [ $i -eq 15 ]; then
         echo "WARNING: Xorg started but not responding after 15 seconds"
         echo "Killing Xorg to prevent system lockup..."
-        sudo kill -9 $XORG_PID 2>/dev/null || true
+        cleanup_xorg "timeout - not responding after 15 seconds"
         echo "Check logs:"
         tail -50 "$TEST_LOG" 2>/dev/null || echo "(log file not found)"
         exit 1
@@ -225,7 +315,7 @@ done
 
 if [ $XORG_STARTED -eq 0 ]; then
     echo "ERROR: Xorg failed to start properly"
-    sudo kill -9 $XORG_PID 2>/dev/null || true
+    cleanup_xorg "failed to start properly"
     exit 1
 fi
 
@@ -234,7 +324,16 @@ echo ""
 
 # Test 1: Check if XR-0 appears in xrandr
 echo "=== Test 1: Check if XR-0 appears in xrandr ==="
-DISPLAY="$TEST_DISPLAY" xrandr --listoutputs 2>&1 | grep -i "XR-0" && echo "✓ XR-0 found!" || echo "✗ XR-0 not found"
+echo "All outputs:"
+DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" || DISPLAY="$TEST_DISPLAY" xrandr 2>&1
+echo ""
+if DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -i "XR-0" >/dev/null; then
+    echo "✓ XR-0 found!"
+else
+    echo "✗ XR-0 not found"
+    echo "Checking Xorg log for XR-0 initialization..."
+    grep -i "XR-0\|Virtual XR\|post_screen" "$TEST_LOG" 2>/dev/null | tail -10 || echo "No XR-0 messages in log"
+fi
 
 echo ""
 echo "=== Test 2: List all monitors ==="
@@ -246,13 +345,20 @@ DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --query 2>&1 || echo "XR-0 query fa
 
 echo ""
 echo "=== Test 4: Check AR_MODE property ==="
-DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --get AR_MODE 2>&1 || echo "AR_MODE property query failed"
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --prop 2>&1 | grep -i "AR_MODE" >/dev/null; then
+    echo "✓ AR_MODE property found:"
+    DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --prop 2>&1 | grep -i "AR_MODE" -A2
+else
+    echo "✗ AR_MODE property not found"
+    echo "All properties for XR-0:"
+    DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --prop 2>&1 | head -20 || echo "Could not query XR-0 properties (output may not exist)"
+fi
 
 echo ""
 echo "=== Test 5: Check Xorg log for initialization ==="
-if grep -i "virtual.*xr\|xr-0.*created" "$TEST_LOG" 2>/dev/null; then
-    echo "✓ Found initialization message in log"
-    grep -i "virtual.*xr\|xr-0" "$TEST_LOG"
+if grep -i "virtual.*xr\|xr-0.*created\|post_screen" "$TEST_LOG" 2>/dev/null; then
+    echo "✓ Found initialization messages in log:"
+    grep -i "virtual.*xr\|xr-0\|post_screen" "$TEST_LOG" | tail -10
 else
     echo "✗ No initialization message found"
     echo "Last 30 lines of log:"
@@ -260,13 +366,38 @@ else
 fi
 
 echo ""
-echo "=== Cleanup ==="
-echo "Stopping Xorg..."
-sudo kill $XORG_PID 2>/dev/null || true
-sleep 1
-if kill -0 $XORG_PID 2>/dev/null; then
-    echo "Force killing Xorg..."
-    sudo kill -9 $XORG_PID 2>/dev/null || true
+echo "=== Test 6: Verify graphics are working ==="
+echo "Running a simple X test (xeyes or xclock)..."
+if command -v xeyes >/dev/null 2>&1; then
+    DISPLAY="$TEST_DISPLAY" timeout 2 xeyes >/dev/null 2>&1 &
+    XEYES_PID=$!
+    sleep 1
+    if kill -0 $XEYES_PID 2>/dev/null; then
+        echo "✓ Graphics test started (xeyes)"
+        kill $XEYES_PID 2>/dev/null || true
+    else
+        echo "✗ Graphics test failed"
+    fi
+elif command -v xclock >/dev/null 2>&1; then
+    DISPLAY="$TEST_DISPLAY" timeout 2 xclock >/dev/null 2>&1 &
+    XCLOCK_PID=$!
+    sleep 1
+    if kill -0 $XCLOCK_PID 2>/dev/null; then
+        echo "✓ Graphics test started (xclock)"
+        kill $XCLOCK_PID 2>/dev/null || true
+    else
+        echo "✗ Graphics test failed"
+    fi
+else
+    echo "Note: xeyes/xclock not available, skipping graphics test"
+    echo "The black screen is normal - there's no window manager running"
 fi
+
+echo ""
+echo "=== Cleanup ==="
+# Cleanup is handled by the trap, but we'll do it explicitly here too
+# Temporarily disable the trap to avoid double cleanup
+trap - EXIT INT TERM
+cleanup_xorg "normal test completion"
 echo "Test complete."
 
