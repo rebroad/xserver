@@ -399,8 +399,40 @@ fi
 echo ""
 echo "Testing mouse pointer..."
 if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
-    echo "✓ Mouse pointer can be set"
-    echo "  Move your mouse to verify the pointer is visible and moveable"
+    echo "✓ Mouse pointer cursor set"
+
+    # Try to actually move the pointer to verify it's working
+    if command -v xdotool >/dev/null 2>&1; then
+        echo "  Testing pointer movement with xdotool..."
+        # Get current position
+        OLD_POS=$(DISPLAY="$TEST_DISPLAY" xdotool getmouselocation 2>/dev/null | awk '{print $1" "$2}' | sed 's/[xy]://g')
+        if [ -n "$OLD_POS" ]; then
+            echo "  Current mouse position: $OLD_POS"
+            # Move mouse slightly
+            DISPLAY="$TEST_DISPLAY" xdotool mousemove_relative 10 10 >/dev/null 2>&1
+            sleep 0.5
+            NEW_POS=$(DISPLAY="$TEST_DISPLAY" xdotool getmouselocation 2>/dev/null | awk '{print $1" "$2}' | sed 's/[xy]://g')
+            if [ -n "$NEW_POS" ] && [ "$OLD_POS" != "$NEW_POS" ]; then
+                echo "  ✓ Mouse pointer is moveable (moved from $OLD_POS to $NEW_POS)"
+            else
+                echo "  ⚠ Mouse pointer movement test inconclusive"
+            fi
+        else
+            echo "  ⚠ Could not get mouse position"
+        fi
+    elif command -v xinput >/dev/null 2>&1; then
+        echo "  Checking pointer devices..."
+        POINTER_DEVICES=$(DISPLAY="$TEST_DISPLAY" xinput list 2>/dev/null | grep -i "pointer\|mouse" | head -2)
+        if [ -n "$POINTER_DEVICES" ]; then
+            echo "  Found pointer devices:"
+            echo "$POINTER_DEVICES" | sed 's/^/    /'
+            echo "  ✓ Pointer devices detected - move your mouse to verify it's visible"
+        else
+            echo "  ⚠ No pointer devices found"
+        fi
+    else
+        echo "  Note: xdotool/xinput not available - manually move your mouse to verify pointer is visible"
+    fi
 else
     echo "✗ Failed to set mouse pointer"
 fi
