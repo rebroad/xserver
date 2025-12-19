@@ -12,6 +12,7 @@ TEST_LOG="/tmp/Xorg_test.log"
 TEST_VT="8"
 XORG_PID=""
 XORG_START_TIME=""
+ORIGINAL_VT=""
 
 # Cleanup function to ensure Xorg is always killed
 cleanup_xorg() {
@@ -101,6 +102,15 @@ trap 'cleanup_xorg "interrupted (SIGINT)"' INT
 trap 'cleanup_xorg "terminated (SIGTERM)"' TERM
 
 echo "=== Testing Virtual XR Connector ==="
+echo ""
+
+# Detect and save the original VT
+ORIGINAL_VT=$(fgconsole 2>/dev/null || echo "7")
+if [ -z "$ORIGINAL_VT" ] || [ "$ORIGINAL_VT" = "unknown" ]; then
+    # Fallback: try to detect from who command
+    ORIGINAL_VT=$(who | grep -E "\(:0\)" | head -1 | sed 's/.*tty\([0-9]*\).*/\1/' || echo "7")
+fi
+echo "Original VT detected: $ORIGINAL_VT"
 echo ""
 
 # Detect running X servers and warn user
@@ -344,13 +354,23 @@ DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --query 2>&1 || echo "XR-0 query fa
 
 echo ""
 echo "=== Test 4: Check AR_MODE property ==="
+echo "Checking Xorg log for AR_MODE property creation..."
+AR_MODE_LOGS=$(grep -i "AR_MODE" "$TEST_LOG" 2>/dev/null | tail -5)
+if [ -n "$AR_MODE_LOGS" ]; then
+    echo "AR_MODE property creation attempts in log:"
+    echo "$AR_MODE_LOGS"
+fi
+
 if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --prop 2>&1 | grep -i "AR_MODE" >/dev/null; then
-    echo "✓ AR_MODE property found:"
+    echo "✓ AR_MODE property found in xrandr:"
     DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --prop 2>&1 | grep -i "AR_MODE" -A2
 else
-    echo "✗ AR_MODE property not found"
+    echo "✗ AR_MODE property not found in xrandr"
     echo "All properties for XR-0:"
     DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --prop 2>&1 | head -20 || echo "Could not query XR-0 properties (output may not exist)"
+    echo ""
+    echo "Note: Property may have been created but output was recreated, losing the property."
+    echo "Check the Xorg log above for AR_MODE creation messages."
 fi
 
 echo ""
@@ -389,30 +409,60 @@ fi
 echo ""
 echo "Testing graphics on all outputs..."
 if command -v xlogo >/dev/null 2>&1; then
-    # Get list of connected outputs
-    OUTPUTS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | awk '{print $1}')
-    if [ -z "$OUTPUTS" ]; then
-        # Fallback: try to get any outputs
+    # Get list of connected outputs with their positions
+    # Format: output_name x_pos y_pos (from xrandr output like "DP-1 connected 1920x1080+1920+0")
+    OUTPUT_INFO=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | awk '{
+        # Extract output name, resolution, and position
+        # Example: "DP-1 connected 1920x1080+1920+0 (normal left inverted right x axis y axis) 1600mm x 900mm"
+        output=$1
+        # Find the position (format: +X+Y)
+        match($0, /\+[0-9]+\+[0-9]+/)
+        if (RSTART > 0) {
+            pos=substr($0, RSTART+1, RLENGTH-1)
+            split(pos, coords, "+")
+            x=coords[1]
+            y=coords[2]
+            print output " " x " " y
+        } else {
+            # No position found, assume 0,0
+            print output " 0 0"
+        }
+    }')
+
+    if [ -z "$OUTPUT_INFO" ]; then
+        # Fallback: try to get any outputs without position info
         OUTPUTS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | awk '{print $1}' | head -3)
+        if [ -n "$OUTPUTS" ]; then
+            OUTPUT_INFO=""
+            for output in $OUTPUTS; do
+                OUTPUT_INFO="$OUTPUT_INFO $output 0 0"
+            done
+        fi
     fi
 
-    if [ -n "$OUTPUTS" ]; then
-        echo "Found outputs: $OUTPUTS"
-        XLOGO_PIDS=""
-        X_POS=100
-        Y_POS=100
+    if [ -n "$OUTPUT_INFO" ]; then
+        echo "Found outputs with positions:"
+        echo "$OUTPUT_INFO" | while read output x_pos y_pos; do
+            echo "  $output at ($x_pos, $y_pos)"
+        done
 
-        for output in $OUTPUTS; do
-            echo "  Starting xlogo on $output at position ${X_POS},${Y_POS}..."
-            DISPLAY="$TEST_DISPLAY" xlogo -geometry 200x200+${X_POS}+${Y_POS} >/tmp/xlogo_${output}.log 2>&1 &
+        XLOGO_PIDS=""
+        echo "$OUTPUT_INFO" | while read output x_pos y_pos; do
+            # Position window relative to the output's position, offset by 100,100
+            win_x=$((x_pos + 100))
+            win_y=$((y_pos + 100))
+            echo "  Starting xlogo on $output at screen position ${win_x},${win_y}..."
+            DISPLAY="$TEST_DISPLAY" xlogo -geometry 200x200+${win_x}+${win_y} >/tmp/xlogo_${output}.log 2>&1 &
             XLOGO_PID=$!
             XLOGO_PIDS="$XLOGO_PIDS $XLOGO_PID"
-            X_POS=$((X_POS + 250))
-            if [ $X_POS -gt 2000 ]; then
-                X_POS=100
-                Y_POS=$((Y_POS + 250))
-            fi
+            echo "$XLOGO_PID" >> /tmp/xlogo_pids.txt
         done
+
+        # Read PIDs from temp file (since while loop runs in subshell)
+        if [ -f /tmp/xlogo_pids.txt ]; then
+            XLOGO_PIDS=$(cat /tmp/xlogo_pids.txt | tr '\n' ' ')
+            rm -f /tmp/xlogo_pids.txt
+        fi
 
         echo "  xlogo windows running for 8 seconds (PIDs:$XLOGO_PIDS)"
         echo "  You should see X logos on each display/output"
@@ -439,5 +489,16 @@ echo "=== Cleanup ==="
 # Temporarily disable the trap to avoid double cleanup
 trap - EXIT INT TERM
 cleanup_xorg "normal test completion"
+
+# Switch back to original VT if we can
+if [ -n "$ORIGINAL_VT" ] && [ "$ORIGINAL_VT" != "$TEST_VT" ]; then
+    echo "Switching back to original VT $ORIGINAL_VT..."
+    if command -v chvt >/dev/null 2>&1; then
+        sudo chvt "$ORIGINAL_VT" 2>/dev/null && echo "✓ Switched back to VT $ORIGINAL_VT" || echo "⚠ Could not switch back to VT $ORIGINAL_VT (you may need to press Ctrl+Alt+F$ORIGINAL_VT)"
+    else
+        echo "⚠ chvt not available, you may need to manually switch back to VT $ORIGINAL_VT (Ctrl+Alt+F$ORIGINAL_VT)"
+    fi
+fi
+
 echo "Test complete."
 
