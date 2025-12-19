@@ -125,10 +125,11 @@ cleanup_xorg() {
     fi
 }
 
-# Set up trap to ensure cleanup happens on exit
-trap 'cleanup_xorg "script exit (trap)"' EXIT
-trap 'cleanup_xorg "interrupted (SIGINT)"' INT
-trap 'cleanup_xorg "terminated (SIGTERM)"' TERM
+# Set up trap to ensure cleanup happens on exit (but only on Ctrl+C, not normal exit)
+# We want to keep Xorg running for interactive testing
+trap 'cleanup_xorg "interrupted (SIGINT)"; exit 1' INT
+trap 'cleanup_xorg "terminated (SIGTERM)"; exit 1' TERM
+# Don't trap EXIT - let user decide when to exit
 
 echo "=== Testing Virtual XR Connector ==="
 echo ""
@@ -691,33 +692,44 @@ else
 fi
 
 echo ""
-echo "=== Test 6: Start window manager (for cursor visibility) ==="
-# Try to find a lightweight window manager
-WM_CMD=""
-if command -v openbox >/dev/null 2>&1; then
-    WM_CMD="openbox"
-elif command -v twm >/dev/null 2>&1; then
-    WM_CMD="twm"
-elif command -v metacity >/dev/null 2>&1; then
-    WM_CMD="metacity --replace"
-elif command -v xfwm4 >/dev/null 2>&1; then
-    WM_CMD="xfwm4 --replace"
-fi
-
-if [ -n "$WM_CMD" ]; then
-    echo "Starting window manager: $WM_CMD"
-    DISPLAY="$TEST_DISPLAY" $WM_CMD >/tmp/wm_${TEST_DISPLAY#:}.log 2>&1 &
-    WM_PID=$!
-    sleep 2  # Give WM time to start
-    if kill -0 $WM_PID 2>/dev/null; then
-        echo "✓ Window manager started (PID: $WM_PID)"
+echo "=== Test 6: Start XFCE4 session ==="
+XFCE_PID=""
+if command -v xfce4-session >/dev/null 2>&1; then
+    echo "Starting XFCE4 session..."
+    export DISPLAY="$TEST_DISPLAY"
+    export XDG_SESSION_TYPE=x11
+    export XDG_CURRENT_DESKTOP=XFCE
+    export DESKTOP_SESSION=xfce
+    # Start XFCE4 session in background
+    DISPLAY="$TEST_DISPLAY" xfce4-session >/tmp/xfce4_${TEST_DISPLAY#:}.log 2>&1 &
+    XFCE_PID=$!
+    sleep 5  # Give XFCE4 time to start
+    if kill -0 $XFCE_PID 2>/dev/null; then
+        echo "✓ XFCE4 session started (PID: $XFCE_PID)"
     else
-        echo "⚠ Window manager may have exited (check /tmp/wm_${TEST_DISPLAY#:}.log)"
-        WM_PID=""
+        echo "⚠ XFCE4 session may have exited (check /tmp/xfce4_${TEST_DISPLAY#:}.log)"
+        XFCE_PID=""
     fi
 else
-    echo "⚠ No window manager found (tried: openbox, twm, metacity, xfwm4)"
-    echo "  Cursor may not be visible without a window manager"
+    echo "⚠ xfce4-session not found - falling back to window manager"
+    # Fallback to window manager
+    WM_CMD=""
+    if command -v openbox >/dev/null 2>&1; then
+        WM_CMD="openbox"
+    elif command -v twm >/dev/null 2>&1; then
+        WM_CMD="twm"
+    elif command -v metacity >/dev/null 2>&1; then
+        WM_CMD="metacity --replace"
+    elif command -v xfwm4 >/dev/null 2>&1; then
+        WM_CMD="xfwm4 --replace"
+    fi
+
+    if [ -n "$WM_CMD" ]; then
+        echo "Starting window manager: $WM_CMD"
+        DISPLAY="$TEST_DISPLAY" $WM_CMD >/tmp/wm_${TEST_DISPLAY#:}.log 2>&1 &
+        XFCE_PID=$!
+        sleep 2
+    fi
 fi
 
 echo ""
@@ -764,14 +776,14 @@ if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
         fi
     fi
 
-    if [ -n "$WM_PID" ]; then
-        echo "  ✓ Window manager is running - cursor should be visible"
+    if [ -n "$XFCE_PID" ]; then
+        echo "  ✓ XFCE4 session is running - cursor should be visible"
         echo ""
         echo "  Note: Physical mouse/touchpad should work when you switch to VT $TEST_VT."
         echo "        Input devices are shared between VTs - the active VT gets input."
         echo "        If mouse doesn't work, check Xorg log for input device errors."
     else
-        echo "  ⚠ No window manager - cursor may not be visible"
+        echo "  ⚠ No window manager/session - cursor may not be visible"
     fi
 else
     echo "✗ Failed to set mouse pointer"
@@ -785,35 +797,266 @@ else
     echo "✗ X server not responding"
 fi
 
-# Keep XLogo running for a bit longer so user can see it
-if [ -n "$XLOGO_PIDS" ]; then
-    echo ""
-    echo "XLogo windows will remain visible for 5 more seconds..."
-    sleep 5
+echo ""
+echo "=== Test 9: Launch XFCE4 Display Settings ==="
+DISPLAY_SETTINGS_PID=""
+if command -v xfce4-display-settings >/dev/null 2>&1; then
+    echo "Launching XFCE4 Display Settings (xfce4-display-settings)..."
 
-    # Kill all xlogo processes
+    # Try to position on external monitor if available
+    EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
+    if [ -n "$EXTERNAL_MONITOR" ]; then
+        # Get position of external monitor
+        MONITOR_POS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "\+[0-9]+\+[0-9]+" | head -1)
+        if [ -n "$MONITOR_POS" ]; then
+            X_POS=$(echo "$MONITOR_POS" | cut -d+ -f2)
+            Y_POS=$(echo "$MONITOR_POS" | cut -d+ -f3)
+            echo "  Positioning on external monitor $EXTERNAL_MONITOR at +${X_POS}+${Y_POS}"
+            DISPLAY="$TEST_DISPLAY" xfce4-display-settings --geometry +${X_POS}+${Y_POS} >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
+        else
+            DISPLAY="$TEST_DISPLAY" xfce4-display-settings >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
+        fi
+    else
+        DISPLAY="$TEST_DISPLAY" xfce4-display-settings >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
+    fi
+
+    DISPLAY_SETTINGS_PID=$!
+    sleep 2  # Give it time to open
+    if kill -0 $DISPLAY_SETTINGS_PID 2>/dev/null; then
+        echo "✓ Display Settings launched (PID: $DISPLAY_SETTINGS_PID)"
+        if [ -n "$EXTERNAL_MONITOR" ]; then
+            echo "  Window positioned on external monitor: $EXTERNAL_MONITOR"
+        fi
+        echo "  You should see the Display Settings window showing RandR outputs"
+    else
+        echo "⚠ Display Settings may have exited immediately (check /tmp/display_settings_${TEST_DISPLAY#:}.log)"
+        DISPLAY_SETTINGS_PID=""
+    fi
+else
+    echo "⚠ xfce4-display-settings not found"
+    echo "  You can manually run: DISPLAY=$TEST_DISPLAY xfce4-display-settings"
+fi
+
+echo ""
+echo "=== Test 10: Automated XR Output Tests ==="
+echo "Waiting 5 seconds for Display Settings to fully open..."
+sleep 5
+
+# Test creating XR outputs
+echo ""
+echo "Creating virtual XR outputs..."
+echo "  Creating XR-0 (1920x1080@60Hz)..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-0:1920:1080:60" 2>/dev/null; then
+    echo "  ✓ XR-0 created"
+    sleep 2  # Give it time to appear
+else
+    echo "  ✗ Failed to create XR-0"
+fi
+
+echo "  Creating XR-1 (2560x1440@60Hz)..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-1:2560:1440:60" 2>/dev/null; then
+    echo "  ✓ XR-1 created"
+    sleep 2
+else
+    echo "  ✗ Failed to create XR-1"
+fi
+
+# List outputs
+echo ""
+echo "Current outputs:"
+DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | head -10
+
+# Test resizing
+echo ""
+echo "Resizing XR-0 to 3840x2160..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_WIDTH 3840 2>/dev/null && \
+   DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_HEIGHT 2160 2>/dev/null; then
+    echo "  ✓ XR-0 resized"
+    sleep 2
+else
+    echo "  ✗ Failed to resize XR-0"
+fi
+
+# Test arranging outputs (connect and position)
+echo ""
+echo "Arranging outputs..."
+echo "  Connecting XR-0..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --auto 2>/dev/null; then
+    echo "  ✓ XR-0 connected"
+    sleep 1
+else
+    echo "  ⚠ Could not connect XR-0 (may need manual arrangement)"
+fi
+
+# Test deleting
+echo ""
+echo "Deleting XR-1..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>/dev/null; then
+    echo "  ✓ XR-1 deleted"
+    sleep 2
+else
+    echo "  ✗ Failed to delete XR-1"
+fi
+
+# Final output list
+echo ""
+echo "Final outputs:"
+DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | head -10
+
+echo ""
+echo "=== Interactive Testing ==="
+echo "Xorg is running on display $TEST_DISPLAY (VT $TEST_VT)"
+echo "XFCE4 session is running (PID: ${XFCE_PID:-N/A})"
+echo "Display Settings should be open - you can see the RandR outputs visually"
+echo ""
+echo "You can now:"
+echo "  - Switch to VT $TEST_VT to see the XFCE4 session"
+echo "  - Use the Display Settings window to arrange outputs"
+echo "  - Create more XR outputs: xrandr --output XR-Manager --set CREATE_XR_OUTPUT 'XR-N:WIDTH:HEIGHT:REFRESH'"
+echo "  - Resize XR outputs: xrandr --output XR-N --set XR_WIDTH WIDTH --set XR_HEIGHT HEIGHT"
+echo "  - Delete XR outputs: xrandr --output XR-Manager --set DELETE_XR_OUTPUT 'XR-N'"
+echo ""
+echo "A dialog will appear on VT $TEST_VT - click 'Exit' when done testing..."
+
+# Show graphical dialog on the test display
+# Try zenity first (more modern), fall back to xmessage
+EXIT_DIALOG_PID=""
+if command -v zenity >/dev/null 2>&1; then
+    # Position dialog on external monitor if available
+    EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
+    if [ -n "$EXTERNAL_MONITOR" ]; then
+        MONITOR_POS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "\+[0-9]+\+[0-9]+" | head -1)
+        if [ -n "$MONITOR_POS" ]; then
+            X_POS=$(echo "$MONITOR_POS" | cut -d+ -f2)
+            Y_POS=$(echo "$MONITOR_POS" | cut -d+ -f3)
+            # zenity doesn't support --geometry, but we can use wmctrl to move it
+            DISPLAY="$TEST_DISPLAY" zenity --question \
+                --title="XR Virtual Output Test" \
+                --text="XR Virtual Output Test is running on display $TEST_DISPLAY (VT $TEST_VT).\n\nClick 'Yes' to exit and clean up, or 'No' to continue testing." \
+                --width=400 --height=150 \
+                >/tmp/zenity_exit_${TEST_DISPLAY#:}.log 2>&1 &
+            EXIT_DIALOG_PID=$!
+            # Try to move window to external monitor using wmctrl if available
+            sleep 1
+            if command -v wmctrl >/dev/null 2>&1 && [ -n "$EXIT_DIALOG_PID" ]; then
+                WINDOW_ID=$(DISPLAY="$TEST_DISPLAY" wmctrl -l 2>/dev/null | grep -i "XR Virtual Output Test" | awk '{print $1}' | head -1)
+                if [ -n "$WINDOW_ID" ]; then
+                    DISPLAY="$TEST_DISPLAY" wmctrl -i -r "$WINDOW_ID" -e 0,$X_POS,$Y_POS,-1,-1 2>/dev/null || true
+                fi
+            fi
+        else
+            DISPLAY="$TEST_DISPLAY" zenity --question \
+                --title="XR Virtual Output Test" \
+                --text="XR Virtual Output Test is running on display $TEST_DISPLAY (VT $TEST_VT).\n\nClick 'Yes' to exit and clean up, or 'No' to continue testing." \
+                --width=400 --height=150 \
+                >/tmp/zenity_exit_${TEST_DISPLAY#:}.log 2>&1 &
+            EXIT_DIALOG_PID=$!
+        fi
+    else
+        DISPLAY="$TEST_DISPLAY" zenity --question \
+            --title="XR Virtual Output Test" \
+            --text="XR Virtual Output Test is running on display $TEST_DISPLAY (VT $TEST_VT).\n\nClick 'Yes' to exit and clean up, or 'No' to continue testing." \
+            --width=400 --height=150 \
+            >/tmp/zenity_exit_${TEST_DISPLAY#:}.log 2>&1 &
+        EXIT_DIALOG_PID=$!
+    fi
+
+    # Wait for dialog result
+    wait $EXIT_DIALOG_PID 2>/dev/null
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "User clicked 'Yes' - exiting..."
+    else
+        echo "User clicked 'No' or dialog closed - showing dialog again..."
+        sleep 1
+        DISPLAY="$TEST_DISPLAY" zenity --question \
+            --title="XR Virtual Output Test" \
+            --text="Click 'Yes' to exit and clean up." \
+            --width=300 --height=100 &
+        wait $! 2>/dev/null
+        EXIT_CODE=$?
+    fi
+elif command -v xmessage >/dev/null 2>&1; then
+    # Fallback to xmessage
+    EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
+    if [ -n "$EXTERNAL_MONITOR" ]; then
+        MONITOR_POS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "\+[0-9]+\+[0-9]+" | head -1)
+        if [ -n "$MONITOR_POS" ]; then
+            X_POS=$(echo "$MONITOR_POS" | cut -d+ -f2)
+            Y_POS=$(echo "$MONITOR_POS" | cut -d+ -f3)
+            DISPLAY="$TEST_DISPLAY" xmessage -center -buttons "Exit:0,Cancel:1" \
+                -geometry +${X_POS}+${Y_POS} \
+                "XR Virtual Output Test is running.\n\nClick 'Exit' to clean up." \
+                >/tmp/xmessage_exit_${TEST_DISPLAY#:}.log 2>&1
+            EXIT_CODE=$?
+        else
+            DISPLAY="$TEST_DISPLAY" xmessage -center -buttons "Exit:0,Cancel:1" \
+                "XR Virtual Output Test is running.\n\nClick 'Exit' to clean up." \
+                >/tmp/xmessage_exit_${TEST_DISPLAY#:}.log 2>&1
+            EXIT_CODE=$?
+        fi
+    else
+        DISPLAY="$TEST_DISPLAY" xmessage -center -buttons "Exit:0,Cancel:1" \
+            "XR Virtual Output Test is running.\n\nClick 'Exit' to clean up." \
+            >/tmp/xmessage_exit_${TEST_DISPLAY#:}.log 2>&1
+        EXIT_CODE=$?
+    fi
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "User clicked 'Exit' - exiting..."
+    else
+        echo "User clicked 'Cancel' - falling back to terminal input..."
+        echo "Press Enter to exit..."
+        read -r
+    fi
+else
+    # No graphical dialog available, use terminal
+    echo "No graphical dialog available - press Enter to exit..."
+    read -r
+fi
+
+echo ""
+echo "=== Cleanup ==="
+# Kill Display Settings if still running
+if [ -n "$DISPLAY_SETTINGS_PID" ] && kill -0 $DISPLAY_SETTINGS_PID 2>/dev/null; then
+    echo "Closing Display Settings..."
+    kill $DISPLAY_SETTINGS_PID 2>/dev/null || true
+    wait $DISPLAY_SETTINGS_PID 2>/dev/null || true
+fi
+
+# Kill XLogo if still running
+if [ -n "$XLOGO_PIDS" ]; then
     for pid in $XLOGO_PIDS; do
         if kill -0 $pid 2>/dev/null; then
             kill $pid 2>/dev/null || true
             wait $pid 2>/dev/null || true
         fi
     done
-    echo "✓ XLogo windows closed"
 fi
 
-echo ""
-echo "=== Cleanup ==="
-# Kill window manager if still running
-if [ -n "$WM_PID" ] && kill -0 $WM_PID 2>/dev/null; then
-    echo "Stopping window manager..."
-    kill $WM_PID 2>/dev/null || true
-    wait $WM_PID 2>/dev/null || true
+# Kill xfwm4 if still running
+if [ -n "$XFWM4_PID" ] && kill -0 $XFWM4_PID 2>/dev/null; then
+    echo "Stopping xfwm4..."
+    kill $XFWM4_PID 2>/dev/null || true
+    sleep 1
+    if kill -0 $XFWM4_PID 2>/dev/null; then
+        kill -9 $XFWM4_PID 2>/dev/null || true
+    fi
 fi
 
-# Cleanup is handled by the trap, but we'll do it explicitly here too
-# Temporarily disable the trap to avoid double cleanup
-trap - EXIT INT TERM
-cleanup_xorg "normal test completion"
+# Kill XFCE4 session if still running
+if [ -n "$XFCE_PID" ] && kill -0 $XFCE_PID 2>/dev/null; then
+    echo "Stopping XFCE4 session..."
+    kill $XFCE_PID 2>/dev/null || true
+    # Give it time to clean up
+    sleep 2
+    if kill -0 $XFCE_PID 2>/dev/null; then
+        echo "Force killing XFCE4 session..."
+        kill -9 $XFCE_PID 2>/dev/null || true
+    fi
+fi
+
+# Cleanup Xorg
+cleanup_xorg "user requested exit"
 
 # Switch back to original VT if we can
 if [ -n "$ORIGINAL_VT" ] && [ "$ORIGINAL_VT" != "$TEST_VT" ]; then
