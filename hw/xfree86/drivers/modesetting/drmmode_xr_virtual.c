@@ -17,8 +17,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * OUT OF OR IN CONNECTION WITH THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -27,6 +26,8 @@
 
 #include <X11/Xatom.h>
 #include <xf86drm.h>
+#include <string.h>
+#include <stdlib.h>
 #include "xf86.h"
 #include "xf86str.h"
 #include "xf86Crtc.h"
@@ -41,13 +42,47 @@
 extern void drmmode_output_create_resources(xf86OutputPtr output);
 extern const xf86OutputFuncsRec drmmode_output_funcs;
 
-#define XR_VIRTUAL_OUTPUT_NAME "XR-0"
+#define XR_MANAGER_OUTPUT_NAME "XR-Manager"
 #define XR_AR_MODE_PROPERTY "AR_MODE"
+#define XR_CREATE_OUTPUT_PROPERTY "CREATE_XR_OUTPUT"
+#define XR_DELETE_OUTPUT_PROPERTY "DELETE_XR_OUTPUT"
+#define XR_WIDTH_PROPERTY "XR_WIDTH"
+#define XR_HEIGHT_PROPERTY "XR_HEIGHT"
+#define XR_REFRESH_PROPERTY "XR_REFRESH"
 
-/* Get AR_MODE property atom - use macro to avoid function call overhead */
+/* Structure to track a dynamically created virtual output */
+typedef struct _xr_virtual_output_rec {
+    xf86OutputPtr output;          /* xf86OutputPtr for this virtual output */
+    RROutputPtr randr_output;      /* RandR output */
+    char *name;                    /* Output name (e.g., "XR-0", "XR-1") */
+    int width;                     /* Current width */
+    int height;                    /* Current height */
+    int refresh;                   /* Current refresh rate */
+    struct _xr_virtual_output_rec *next;  /* Linked list */
+} xr_virtual_output_rec, *xr_virtual_output_ptr;
+
+/* Get property atoms - use macros to avoid function call overhead */
 #define XR_AR_MODE_ATOM() MakeAtom(XR_AR_MODE_PROPERTY, strlen(XR_AR_MODE_PROPERTY), TRUE)
+#define XR_CREATE_OUTPUT_ATOM() MakeAtom(XR_CREATE_OUTPUT_PROPERTY, strlen(XR_CREATE_OUTPUT_PROPERTY), TRUE)
+#define XR_DELETE_OUTPUT_ATOM() MakeAtom(XR_DELETE_OUTPUT_PROPERTY, strlen(XR_DELETE_OUTPUT_PROPERTY), TRUE)
+#define XR_WIDTH_ATOM() MakeAtom(XR_WIDTH_PROPERTY, strlen(XR_WIDTH_PROPERTY), TRUE)
+#define XR_HEIGHT_ATOM() MakeAtom(XR_HEIGHT_PROPERTY, strlen(XR_HEIGHT_PROPERTY), TRUE)
+#define XR_REFRESH_ATOM() MakeAtom(XR_REFRESH_PROPERTY, strlen(XR_REFRESH_PROPERTY), TRUE)
 
-/* Create or ensure AR_MODE property exists on the output */
+/* Find a virtual output by name */
+static xr_virtual_output_ptr
+drmmode_xr_find_virtual_output(modesettingPtr ms, const char *name)
+{
+    xr_virtual_output_ptr vout = ms->xr_virtual_outputs;
+    while (vout) {
+        if (vout->name && strcmp(vout->name, name) == 0)
+            return vout;
+        vout = vout->next;
+    }
+    return NULL;
+}
+
+/* Create or ensure AR_MODE property exists on an output */
 static Bool
 drmmode_xr_virtual_ensure_ar_mode_property(ScrnInfoPtr pScrn, RROutputPtr randr_output)
 {
@@ -62,7 +97,6 @@ drmmode_xr_virtual_ensure_ar_mode_property(ScrnInfoPtr pScrn, RROutputPtr randr_
 
     /* Check if property already exists */
     if (RRQueryOutputProperty(randr_output, name)) {
-        xf86DrvMsg(pScrn->scrnIndex, X_INFO, "AR_MODE property already exists\n");
         return TRUE;
     }
 
@@ -80,7 +114,6 @@ drmmode_xr_virtual_ensure_ar_mode_property(ScrnInfoPtr pScrn, RROutputPtr randr_
         return FALSE;
     }
 
-    xf86DrvMsg(pScrn->scrnIndex, X_INFO, "AR_MODE property created successfully\n");
     return TRUE;
 }
 
@@ -89,7 +122,6 @@ static void
 drmmode_xr_virtual_create_resources(xf86OutputPtr output)
 {
     /* Virtual output doesn't need DRM-specific properties */
-    /* Modes and properties are set up in drmmode_xr_virtual_output_post_screen_init */
 }
 
 /* Custom function table for virtual XR output - initialized at runtime */
@@ -105,109 +137,30 @@ drmmode_xr_virtual_output_funcs_init(void)
 }
 
 /**
- * Create a virtual XR connector output.
- * This creates a synthetic RandR output that appears as "XR-0" in xrandr.
- * It's not backed by a real DRM connector, but by an off-screen buffer.
- */
-Bool
-drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
-{
-    modesettingPtr ms = modesettingPTR(pScrn);
-    xf86OutputPtr output;
-    drmmode_output_private_ptr drmmode_output;
-    DisplayModePtr mode;
-    static Bool funcs_initialized = FALSE;
-
-    /* Check if already initialized */
-    if (ms->xr_virtual_output)
-        return TRUE;
-
-    /* Initialize function table on first call */
-    if (!funcs_initialized) {
-        drmmode_xr_virtual_output_funcs_init();
-        funcs_initialized = TRUE;
-    }
-
-    /* Create the output using a custom function table that has a no-op create_resources */
-    output = xf86OutputCreate(pScrn, &drmmode_xr_virtual_output_funcs, XR_VIRTUAL_OUTPUT_NAME);
-    if (!output) {
-        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
-                   "Failed to create virtual XR output\n");
-        return FALSE;
-    }
-
-    /* Allocate private data */
-    drmmode_output = calloc(1, sizeof(drmmode_output_private_rec));
-    if (!drmmode_output) {
-        xf86OutputDestroy(output);
-        return FALSE;
-    }
-
-    drmmode_output->drmmode = drmmode;
-    drmmode_output->output_id = 0; /* Virtual connector, no DRM ID */
-    drmmode_output->mode_output = NULL; /* No real DRM connector */
-    drmmode_output->mode_encoders = NULL;
-    output->driver_private = drmmode_output;
-
-    /* Set output properties */
-    output->mm_width = 0;  /* Virtual, no physical size */
-    output->mm_height = 0;
-    output->subpixel_order = SubPixelUnknown;
-    output->interlaceAllowed = TRUE;
-    output->doubleScanAllowed = TRUE;
-    output->non_desktop = FALSE; /* Appears as normal desktop output */
-
-    /* Create a minimal default mode so the output appears in xrandr */
-    /* Modes will be created dynamically when Breezy enables the connector */
-    mode = xf86ModesAdd(NULL, xf86CVTMode(1920, 1080, 60, FALSE, FALSE));
-    if (mode) {
-        mode->name = XNFstrdup("1920x1080");
-        mode->type = M_T_DEFAULT;
-        output->probed_modes = xf86ModesAdd(output->probed_modes, mode);
-    }
-
-    /* Don't create RandR output here - the screen doesn't exist yet.
-     * We'll create it in drmmode_xr_virtual_output_post_screen_init() */
-    output->randr_output = NULL;
-
-    /* Store reference */
-    ms->xr_virtual_output = output;
-    ms->xr_virtual_enabled = FALSE; /* Disabled by default */
-    ms->xr_ar_mode = FALSE;
-
-    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Virtual XR connector (XR-0) created (RandR output will be created after screen init)\n");
-
-    return TRUE;
-}
-
-/**
- * Set modes for the virtual XR output by converting DisplayModePtr to RRModePtr
+ * Set modes for a virtual XR output by converting DisplayModePtr to RRModePtr
  */
 static void
-drmmode_xr_virtual_set_modes(xf86OutputPtr output)
+drmmode_xr_virtual_set_modes(xf86OutputPtr output, int width, int height, int refresh)
 {
-    if (!output->randr_output || !output->probed_modes)
+    if (!output->randr_output)
         return;
 
     DisplayModePtr mode;
     RRModePtr *rrmodes = NULL;
     int nmode = 0;
-    int npreferred = 0;
+    char mode_name[32];
 
-    /* Count modes */
-    for (mode = output->probed_modes; mode; mode = mode->next)
-        nmode++;
-
-    if (nmode == 0)
+    /* Create a single mode with the specified dimensions */
+    mode = xf86CVTMode(width, height, refresh, FALSE, FALSE);
+    if (!mode)
         return;
 
-    rrmodes = calloc(nmode, sizeof(RRModePtr));
-    if (!rrmodes)
-        return;
+    snprintf(mode_name, sizeof(mode_name), "%dx%d", width, height);
+    mode->name = XNFstrdup(mode_name);
+    mode->type = M_T_USERPREF | M_T_PREFERRED;
 
-    nmode = 0;
-    for (mode = output->probed_modes; mode; mode = mode->next) {
+    /* Convert to RRMode */
+    {
         xRRModeInfo modeInfo;
         RRModePtr rrmode;
 
@@ -226,112 +179,559 @@ drmmode_xr_virtual_set_modes(xf86OutputPtr output)
 
         rrmode = RRModeGet(&modeInfo, mode->name);
         if (rrmode) {
-            rrmodes[nmode++] = rrmode;
-            if (mode->type & M_T_PREFERRED)
-                npreferred++;
+            rrmodes = calloc(1, sizeof(RRModePtr));
+            if (rrmodes) {
+                rrmodes[0] = rrmode;
+                nmode = 1;
+            }
         }
     }
 
     if (nmode > 0) {
-        RROutputSetModes(output->randr_output, rrmodes, nmode, npreferred);
+        RROutputSetModes(output->randr_output, rrmodes, nmode, 1);
     }
 
     free(rrmodes);
+    xf86DeleteMode(&output->probed_modes, mode);
 }
 
 /**
- * Create RandR output for virtual XR connector after screen is initialized.
- * This must be called from ScreenInit or later, when the screen exists.
+ * Create a new virtual XR output dynamically
  */
-Bool
-drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
+/* Forward declaration */
+static Bool drmmode_xr_virtual_set_property(xf86OutputPtr output, Atom property,
+                                             RRPropertyValuePtr value);
+
+static xr_virtual_output_ptr
+drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
+                                 const char *name, int width, int height, int refresh)
 {
     modesettingPtr ms = modesettingPTR(pScrn);
-    xf86OutputPtr output = ms->xr_virtual_output;
-    static RROutputPtr last_randr_output = NULL;
-    static int call_count = 0;
+    xf86OutputPtr output;
+    drmmode_output_private_ptr drmmode_output;
+    xr_virtual_output_ptr vout;
+    ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
+    static Bool funcs_initialized = FALSE;
 
-    call_count++;
-    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "drmmode_xr_virtual_output_post_screen_init: called (call #%d)\n", call_count);
-
-    if (!output) {
+    /* Check if output with this name already exists */
+    if (drmmode_xr_find_virtual_output(ms, name)) {
         xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                   "Virtual XR output not found in post_screen_init\n");
-        return FALSE;
+                   "Virtual XR output '%s' already exists\n", name);
+        return NULL;
     }
 
-    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "drmmode_xr_virtual_output_post_screen_init: output found, randr_output=%p (was %p)\n",
-               output->randr_output, last_randr_output);
-
-    /* If RandR output already exists (created by xf86RandR12CreateObjects12),
-     * we still need to set up the AR_MODE property and modes */
-    if (output->randr_output) {
-        /* Check if this is the same output or a new one */
-        if (output->randr_output == last_randr_output) {
-            xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                       "Same RandR output, property should already exist\n");
-        } else {
-            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                       "RandR output changed! Old: %p, New: %p (property may be lost)\n",
-                       last_randr_output, output->randr_output);
-            last_randr_output = output->randr_output;
-        }
-
-        /* Make sure modes are set */
-        drmmode_xr_virtual_set_modes(output);
-
-        /* Create AR_MODE property if it doesn't exist */
-        drmmode_xr_virtual_ensure_ar_mode_property(pScrn, output->randr_output);
-
-        RRPostPendingProperties(output->randr_output);
-        return TRUE;
+    /* Initialize function table on first call */
+    if (!funcs_initialized) {
+        drmmode_xr_virtual_output_funcs_init();
+        funcs_initialized = TRUE;
     }
 
-    /* Now we can safely create the RandR output - screen exists */
-    output->randr_output = RROutputCreate(xf86ScrnToScreen(pScrn),
-                                          XR_VIRTUAL_OUTPUT_NAME,
-                                          strlen(XR_VIRTUAL_OUTPUT_NAME),
-                                          output);
+    /* Create the xf86Output with property handler for resize */
+    {
+        static xf86OutputFuncsRec virtual_output_funcs;
+        virtual_output_funcs = drmmode_xr_virtual_output_funcs;
+        virtual_output_funcs.set_property = drmmode_xr_virtual_set_property;
+        output = xf86OutputCreate(pScrn, &virtual_output_funcs, name);
+    }
+    if (!output) {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                   "Failed to create virtual XR output '%s'\n", name);
+        return NULL;
+    }
+
+    /* Allocate private data */
+    drmmode_output = calloc(1, sizeof(drmmode_output_private_rec));
+    if (!drmmode_output) {
+        xf86OutputDestroy(output);
+        return NULL;
+    }
+
+    drmmode_output->drmmode = drmmode;
+    drmmode_output->output_id = 0; /* Virtual connector, no DRM ID */
+    drmmode_output->mode_output = NULL; /* No real DRM connector */
+    drmmode_output->mode_encoders = NULL;
+    output->driver_private = drmmode_output;
+
+    /* Set output properties */
+    output->mm_width = 0;  /* Virtual, no physical size */
+    output->mm_height = 0;
+    output->subpixel_order = SubPixelUnknown;
+    output->interlaceAllowed = TRUE;
+    output->doubleScanAllowed = TRUE;
+    output->non_desktop = FALSE;
+
+    /* Create RandR output */
+    output->randr_output = RROutputCreate(pScreen, name, strlen(name), output);
     if (!output->randr_output) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
-                   "Failed to create RandR output for virtual XR\n");
-        return FALSE;
+                   "Failed to create RandR output for '%s'\n", name);
+        free(drmmode_output);
+        xf86OutputDestroy(output);
+        return NULL;
     }
 
-    last_randr_output = output->randr_output;
-    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Created new RandR output: %p\n", output->randr_output);
+    /* Set connection to disconnected initially (will be connected when enabled) */
+    RROutputSetConnection(output->randr_output, RR_Disconnected);
+
+    /* Set modes */
+    drmmode_xr_virtual_set_modes(output, width, height, refresh);
 
     /* Create AR_MODE property */
     drmmode_xr_virtual_ensure_ar_mode_property(pScrn, output->randr_output);
 
-    /* Set modes for the output */
-    drmmode_xr_virtual_set_modes(output);
+    /* Create resize properties */
+    {
+        Atom width_atom = XR_WIDTH_ATOM();
+        Atom height_atom = XR_HEIGHT_ATOM();
+        Atom refresh_atom = XR_REFRESH_ATOM();
+        INT32 width_val = width;
+        INT32 height_val = height;
+        INT32 refresh_val = refresh;
 
-    /* Note: We do NOT call drmmode_output_create_resources() for the virtual output
-     * because it expects a real DRM connector (mode_output), which we don't have.
-     * The virtual output doesn't need DRM-specific properties. */
+        if (width_atom != BAD_RESOURCE) {
+            RRConfigureOutputProperty(output->randr_output, width_atom, FALSE, FALSE, FALSE, 1, &width_val);
+            RRChangeOutputProperty(output->randr_output, width_atom, XA_INTEGER, 32,
+                                   PropModeReplace, 1, &width_val, FALSE, FALSE);
+        }
+        if (height_atom != BAD_RESOURCE) {
+            RRConfigureOutputProperty(output->randr_output, height_atom, FALSE, FALSE, FALSE, 1, &height_val);
+            RRChangeOutputProperty(output->randr_output, height_atom, XA_INTEGER, 32,
+                                   PropModeReplace, 1, &height_val, FALSE, FALSE);
+        }
+        if (refresh_atom != BAD_RESOURCE) {
+            RRConfigureOutputProperty(output->randr_output, refresh_atom, FALSE, FALSE, FALSE, 1, &refresh_val);
+            RRChangeOutputProperty(output->randr_output, refresh_atom, XA_INTEGER, 32,
+                                   PropModeReplace, 1, &refresh_val, FALSE, FALSE);
+        }
+    }
+
     RRPostPendingProperties(output->randr_output);
+    RROutputChanged(output->randr_output, TRUE);
+    RRTellChanged(pScreen);
+
+    /* Allocate and initialize virtual output record */
+    vout = calloc(1, sizeof(xr_virtual_output_rec));
+    if (!vout) {
+        RROutputDestroy(output->randr_output);
+        free(drmmode_output);
+        xf86OutputDestroy(output);
+        return NULL;
+    }
+
+    vout->output = output;
+    vout->randr_output = output->randr_output;
+    vout->name = strdup(name);
+    vout->width = width;
+    vout->height = height;
+    vout->refresh = refresh;
+
+    /* Add to list */
+    vout->next = ms->xr_virtual_outputs;
+    ms->xr_virtual_outputs = vout;
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Virtual XR connector (XR-0) RandR output created\n");
+               "Created virtual XR output '%s' (%dx%d@%dHz)\n",
+               name, width, height, refresh);
+
+    return vout;
+}
+
+/**
+ * Delete a virtual XR output
+ */
+static Bool
+drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
+{
+    modesettingPtr ms = modesettingPTR(pScrn);
+    xr_virtual_output_ptr vout, prev = NULL;
+
+    /* Find the output */
+    vout = ms->xr_virtual_outputs;
+    while (vout) {
+        if (vout->name && strcmp(vout->name, name) == 0)
+            break;
+        prev = vout;
+        vout = vout->next;
+    }
+
+    if (!vout) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "Virtual XR output '%s' not found\n", name);
+        return FALSE;
+    }
+
+    /* Remove from list */
+    if (prev)
+        prev->next = vout->next;
+    else
+        ms->xr_virtual_outputs = vout->next;
+
+    /* Destroy RandR output */
+    if (vout->randr_output) {
+        RROutputDestroy(vout->randr_output);
+        RRTellChanged(xf86ScrnToScreen(pScrn));
+    }
+
+    /* Destroy xf86Output */
+    if (vout->output) {
+        drmmode_output_private_ptr drmmode_output = vout->output->driver_private;
+        if (drmmode_output)
+            free(drmmode_output);
+        xf86OutputDestroy(vout->output);
+    }
+
+    /* Free name and record */
+    if (vout->name)
+        free(vout->name);
+    free(vout);
+
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "Deleted virtual XR output '%s'\n", name);
 
     return TRUE;
 }
 
 /**
- * Clean up virtual XR connector
+ * Resize a virtual XR output
+ */
+static Bool
+drmmode_xr_resize_virtual_output(ScrnInfoPtr pScrn, xr_virtual_output_ptr vout,
+                                  int width, int height, int refresh)
+{
+    if (!vout || !vout->output || !vout->randr_output)
+        return FALSE;
+
+    /* Update dimensions */
+    vout->width = width;
+    vout->height = height;
+    vout->refresh = refresh;
+
+    /* Update modes */
+    drmmode_xr_virtual_set_modes(vout->output, width, height, refresh);
+
+    /* Update properties */
+    {
+        Atom width_atom = XR_WIDTH_ATOM();
+        Atom height_atom = XR_HEIGHT_ATOM();
+        Atom refresh_atom = XR_REFRESH_ATOM();
+        INT32 width_val = width;
+        INT32 height_val = height;
+        INT32 refresh_val = refresh;
+
+        if (width_atom != BAD_RESOURCE) {
+            RRChangeOutputProperty(vout->randr_output, width_atom, XA_INTEGER, 32,
+                                   PropModeReplace, 1, &width_val, FALSE, FALSE);
+        }
+        if (height_atom != BAD_RESOURCE) {
+            RRChangeOutputProperty(vout->randr_output, height_atom, XA_INTEGER, 32,
+                                   PropModeReplace, 1, &height_val, FALSE, FALSE);
+        }
+        if (refresh_atom != BAD_RESOURCE) {
+            RRChangeOutputProperty(vout->randr_output, refresh_atom, XA_INTEGER, 32,
+                                   PropModeReplace, 1, &refresh_val, FALSE, FALSE);
+        }
+    }
+
+    RROutputChanged(vout->randr_output, TRUE);
+    RRTellChanged(xf86ScrnToScreen(pScrn));
+
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "Resized virtual XR output '%s' to %dx%d@%dHz\n",
+               vout->name, width, height, refresh);
+
+    return TRUE;
+}
+
+/**
+ * Property handler for XR-Manager output (handles CREATE/DELETE commands)
+ */
+static Bool
+drmmode_xr_manager_set_property(xf86OutputPtr output, Atom property,
+                                 RRPropertyValuePtr value)
+{
+    ScrnInfoPtr pScrn = output->scrn;
+    modesettingPtr ms = modesettingPTR(pScrn);
+    drmmode_ptr drmmode = &ms->drmmode;
+    const char *prop_name;
+    char *command = NULL;
+    char *name = NULL, *end;
+    int width = 1920, height = 1080, refresh = 60;
+
+    prop_name = NameForAtom(property);
+    if (!prop_name)
+        return FALSE;
+
+    /* Only handle our custom properties */
+    if (strcmp(prop_name, XR_CREATE_OUTPUT_PROPERTY) != 0 &&
+        strcmp(prop_name, XR_DELETE_OUTPUT_PROPERTY) != 0) {
+        return FALSE; /* Let default handler deal with it */
+    }
+
+    /* Extract command string from property value */
+    if (value->type != XA_STRING || value->format != 8) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "XR property value must be STRING format\n");
+        return FALSE;
+    }
+
+    command = strndup((char *)value->data, value->size);
+    if (!command)
+        return FALSE;
+
+    if (strcmp(prop_name, XR_CREATE_OUTPUT_PROPERTY) == 0) {
+        /* Format: "XR-0:1920:1080:60" or "XR-0:1920:1080" (refresh defaults to 60) */
+        name = command;
+        end = strchr(name, ':');
+        if (end) {
+            *end++ = '\0';
+            width = (int)strtol(end, &end, 10);
+            if (*end == ':') {
+                end++;
+                height = (int)strtol(end, &end, 10);
+                if (*end == ':') {
+                    end++;
+                    refresh = (int)strtol(end, NULL, 10);
+                }
+            }
+        }
+
+        if (!name || !name[0]) {
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                       "CREATE_XR_OUTPUT: invalid format, expected 'NAME:WIDTH:HEIGHT[:REFRESH]'\n");
+            free(command);
+            return FALSE;
+        }
+
+        drmmode_xr_create_virtual_output(pScrn, drmmode, name, width, height, refresh);
+    } else if (strcmp(prop_name, XR_DELETE_OUTPUT_PROPERTY) == 0) {
+        /* Format: "XR-0" */
+        drmmode_xr_delete_virtual_output(pScrn, command);
+    }
+
+    free(command);
+    return TRUE;
+}
+
+/**
+ * Property handler for individual XR outputs (handles resize commands)
+ */
+static Bool
+drmmode_xr_virtual_set_property(xf86OutputPtr output, Atom property,
+                                 RRPropertyValuePtr value)
+{
+    ScrnInfoPtr pScrn = output->scrn;
+    modesettingPtr ms = modesettingPTR(pScrn);
+    xr_virtual_output_ptr vout;
+    const char *prop_name;
+    int new_width, new_height, new_refresh;
+
+    prop_name = NameForAtom(property);
+    if (!prop_name)
+        return FALSE;
+
+    /* Find the virtual output record */
+    vout = ms->xr_virtual_outputs;
+    while (vout) {
+        if (vout->output == output)
+            break;
+        vout = vout->next;
+    }
+
+    if (!vout)
+        return FALSE; /* Not a virtual output, let default handler deal with it */
+
+    /* Handle resize properties */
+    if (value->type != XA_INTEGER || value->format != 32 || value->size != 1) {
+        return FALSE;
+    }
+
+    new_width = vout->width;
+    new_height = vout->height;
+    new_refresh = vout->refresh;
+
+    if (strcmp(prop_name, XR_WIDTH_PROPERTY) == 0) {
+        new_width = *(INT32 *)value->data;
+    } else if (strcmp(prop_name, XR_HEIGHT_PROPERTY) == 0) {
+        new_height = *(INT32 *)value->data;
+    } else if (strcmp(prop_name, XR_REFRESH_PROPERTY) == 0) {
+        new_refresh = *(INT32 *)value->data;
+    } else {
+        return FALSE; /* Not a resize property */
+    }
+
+    /* Validate dimensions */
+    if (new_width < 64 || new_width > 16384 ||
+        new_height < 64 || new_height > 16384 ||
+        new_refresh < 1 || new_refresh > 1000) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "Invalid dimensions/refresh for XR output '%s': %dx%d@%dHz\n",
+                   vout->name, new_width, new_height, new_refresh);
+        return FALSE;
+    }
+
+    /* Apply resize */
+    return drmmode_xr_resize_virtual_output(pScrn, vout, new_width, new_height, new_refresh);
+}
+
+/**
+ * Create the XR-Manager control output (always disconnected, used for control)
+ */
+Bool
+drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
+{
+    modesettingPtr ms = modesettingPTR(pScrn);
+    xf86OutputPtr output;
+    drmmode_output_private_ptr drmmode_output;
+    static Bool funcs_initialized = FALSE;
+
+    /* Check if already initialized */
+    if (ms->xr_manager_output)
+        return TRUE;
+
+    /* Initialize function table on first call */
+    if (!funcs_initialized) {
+        drmmode_xr_virtual_output_funcs_init();
+        funcs_initialized = TRUE;
+    }
+
+    /* Create custom function table for manager with property handler */
+    {
+        static xf86OutputFuncsRec manager_funcs;
+        manager_funcs = drmmode_xr_virtual_output_funcs;
+        manager_funcs.set_property = drmmode_xr_manager_set_property;
+        output = xf86OutputCreate(pScrn, &manager_funcs, XR_MANAGER_OUTPUT_NAME);
+    }
+
+    if (!output) {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                   "Failed to create XR-Manager output\n");
+        return FALSE;
+    }
+
+    /* Allocate private data */
+    drmmode_output = calloc(1, sizeof(drmmode_output_private_rec));
+    if (!drmmode_output) {
+        xf86OutputDestroy(output);
+        return FALSE;
+    }
+
+    drmmode_output->drmmode = drmmode;
+    drmmode_output->output_id = 0;
+    drmmode_output->mode_output = NULL;
+    drmmode_output->mode_encoders = NULL;
+    output->driver_private = drmmode_output;
+
+    /* Set output properties */
+    output->mm_width = 0;
+    output->mm_height = 0;
+    output->subpixel_order = SubPixelUnknown;
+    output->interlaceAllowed = TRUE;
+    output->doubleScanAllowed = TRUE;
+    output->non_desktop = FALSE;
+
+    /* Don't create RandR output here - the screen doesn't exist yet */
+    output->randr_output = NULL;
+
+    /* Store reference */
+    ms->xr_manager_output = output;
+    ms->xr_virtual_outputs = NULL; /* List of dynamically created outputs */
+
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "XR-Manager output created (RandR output will be created after screen init)\n");
+
+    return TRUE;
+}
+
+/**
+ * Create RandR output for XR-Manager after screen is initialized
+ */
+Bool
+drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
+{
+    modesettingPtr ms = modesettingPTR(pScrn);
+    xf86OutputPtr output = ms->xr_manager_output;
+    ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
+    Atom create_atom, delete_atom;
+
+    if (!output) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "XR-Manager output not found in post_screen_init\n");
+        return FALSE;
+    }
+
+    /* If RandR output already exists, we're done */
+    if (output->randr_output) {
+        return TRUE;
+    }
+
+    /* Create RandR output for XR-Manager */
+    output->randr_output = RROutputCreate(pScreen, XR_MANAGER_OUTPUT_NAME,
+                                          strlen(XR_MANAGER_OUTPUT_NAME), output);
+    if (!output->randr_output) {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                   "Failed to create RandR output for XR-Manager\n");
+        return FALSE;
+    }
+
+    /* Always mark as disconnected (it's a control interface, not a real display) */
+    RROutputSetConnection(output->randr_output, RR_Disconnected);
+
+    /* Create CREATE_XR_OUTPUT and DELETE_XR_OUTPUT properties */
+    create_atom = XR_CREATE_OUTPUT_ATOM();
+    delete_atom = XR_DELETE_OUTPUT_ATOM();
+
+    if (create_atom != BAD_RESOURCE) {
+        INT32 dummy = 0;
+        RRConfigureOutputProperty(output->randr_output, create_atom, FALSE, FALSE, FALSE, 1, &dummy);
+    }
+    if (delete_atom != BAD_RESOURCE) {
+        INT32 dummy = 0;
+        RRConfigureOutputProperty(output->randr_output, delete_atom, FALSE, FALSE, FALSE, 1, &dummy);
+    }
+
+    RRPostPendingProperties(output->randr_output);
+
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "XR-Manager RandR output created (use CREATE_XR_OUTPUT/DELETE_XR_OUTPUT properties)\n");
+
+    return TRUE;
+}
+
+/**
+ * Clean up virtual XR outputs
  */
 void
 drmmode_xr_virtual_output_fini(ScrnInfoPtr pScrn)
 {
     modesettingPtr ms = modesettingPTR(pScrn);
+    xr_virtual_output_ptr vout, next;
 
-    if (ms->xr_virtual_output) {
-        xf86OutputPtr output = ms->xr_virtual_output;
+    /* Delete all virtual outputs */
+    vout = ms->xr_virtual_outputs;
+    while (vout) {
+        next = vout->next;
+        if (vout->randr_output)
+            RROutputDestroy(vout->randr_output);
+        if (vout->output) {
+            drmmode_output_private_ptr drmmode_output = vout->output->driver_private;
+            if (drmmode_output)
+                free(drmmode_output);
+            xf86OutputDestroy(vout->output);
+        }
+        if (vout->name)
+            free(vout->name);
+        free(vout);
+        vout = next;
+    }
+    ms->xr_virtual_outputs = NULL;
+
+    /* Clean up XR-Manager */
+    if (ms->xr_manager_output) {
+        xf86OutputPtr output = ms->xr_manager_output;
         drmmode_output_private_ptr drmmode_output = output->driver_private;
+
+        if (output->randr_output)
+            RROutputDestroy(output->randr_output);
 
         if (drmmode_output) {
             free(drmmode_output);
@@ -339,7 +739,7 @@ drmmode_xr_virtual_output_fini(ScrnInfoPtr pScrn)
         }
 
         xf86OutputDestroy(output);
-        ms->xr_virtual_output = NULL;
+        ms->xr_manager_output = NULL;
     }
 
     ms->xr_virtual_enabled = FALSE;
@@ -347,102 +747,22 @@ drmmode_xr_virtual_output_fini(ScrnInfoPtr pScrn)
 }
 
 /**
- * Check if AR mode is enabled for the virtual XR connector
+ * Check if AR mode is enabled for a virtual XR connector
  */
 Bool
 drmmode_xr_get_ar_mode(ScrnInfoPtr pScrn)
 {
     modesettingPtr ms = modesettingPTR(pScrn);
-    xf86OutputPtr output = ms->xr_virtual_output;
-
-    if (!output || !output->randr_output)
-        return FALSE;
-
-    /* Read AR_MODE property from RandR output */
-    Atom prop = XR_AR_MODE_ATOM();
-    if (prop == BAD_RESOURCE)
-        return FALSE;
-
-    /* TODO: Actually read the property value */
-    /* For now, return cached value */
     return ms->xr_ar_mode;
 }
 
 /**
- * Add a mode to the virtual XR connector
- * Called by Breezy when enabling the connector with specific dimensions
- */
-Bool
-drmmode_xr_add_mode(ScrnInfoPtr pScrn, int width, int height, int refresh)
-{
-    modesettingPtr ms = modesettingPTR(pScrn);
-    xf86OutputPtr output = ms->xr_virtual_output;
-    DisplayModePtr mode;
-    char mode_name[32];
-
-    if (!output)
-        return FALSE;
-
-    /* Check if mode already exists */
-    for (mode = output->probed_modes; mode; mode = mode->next) {
-        if (mode->HDisplay == width && mode->VDisplay == height &&
-            (int)(mode->VRefresh + 0.5) == refresh) {
-            return TRUE; /* Mode already exists */
-        }
-    }
-
-    /* Create new mode */
-    mode = xf86CVTMode(width, height, refresh, FALSE, FALSE);
-    if (!mode)
-        return FALSE;
-
-    snprintf(mode_name, sizeof(mode_name), "%dx%d", width, height);
-    mode->name = XNFstrdup(mode_name);
-    mode->type = M_T_USERPREF;
-
-    /* Add to output's mode list */
-    output->probed_modes = xf86ModesAdd(output->probed_modes, mode);
-
-    /* Force output to refresh its modes via get_modes callback */
-    if (output->randr_output && output->funcs && output->funcs->get_modes) {
-        DisplayModePtr all_modes = output->funcs->get_modes(output);
-        (void)all_modes; /* Modes will be registered with RandR by the get_modes implementation */
-        RROutputChanged(output->randr_output, TRUE);
-    }
-
-    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Added mode %dx%d@%dHz to virtual XR connector\n",
-               width, height, refresh);
-
-    return TRUE;
-}
-
-/**
- * Set AR mode for the virtual XR connector
+ * Set AR mode for virtual XR connectors
  */
 Bool
 drmmode_xr_set_ar_mode(ScrnInfoPtr pScrn, Bool enabled)
 {
     modesettingPtr ms = modesettingPTR(pScrn);
-    xf86OutputPtr output = ms->xr_virtual_output;
-
-    if (!output || !output->randr_output)
-        return FALSE;
-
-    Atom prop = XR_AR_MODE_ATOM();
-    if (prop == BAD_RESOURCE)
-        return FALSE;
-
-    INT32 value = enabled ? 1 : 0;
-    int err = RRChangeOutputProperty(output->randr_output, prop,
-                                     XA_INTEGER, 32, PropModeReplace, 1,
-                                     &value, FALSE, FALSE);
-    if (err != 0) {
-        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                   "Failed to set AR_MODE property: %d\n", err);
-        return FALSE;
-    }
-
     ms->xr_ar_mode = enabled;
 
     /* TODO: Implement actual AR mode logic:
@@ -452,4 +772,3 @@ drmmode_xr_set_ar_mode(ScrnInfoPtr pScrn, Bool enabled)
 
     return TRUE;
 }
-
