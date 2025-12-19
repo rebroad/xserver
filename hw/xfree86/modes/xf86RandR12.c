@@ -1759,25 +1759,26 @@ xf86RandR12CreateObjects12(ScreenPtr pScreen)
         xf86OutputPtr output = config->output[o];
         rrScrPrivPtr pScrPriv = rrGetScrPriv(pScreen);
         int i;
+        Bool found_existing = FALSE;
+
+        /* First, try to find existing RandR output with same name and devPrivate */
+        /* This handles the case where output->randr_output was set to NULL
+         * but the RandR output still exists in the list */
+        for (i = 0; i < pScrPriv->numOutputs; i++) {
+            RROutputPtr existing = pScrPriv->outputs[i];
+            if (existing && existing->devPrivate == output &&
+                existing->nameLength == strlen(output->name) &&
+                strncmp(existing->name, output->name, existing->nameLength) == 0) {
+                output->randr_output = existing;
+                found_existing = TRUE;
+                break;
+            }
+        }
 
         /* Only create RandR output if it doesn't already exist */
-        if (!output->randr_output) {
-            /* Try to find existing RandR output with same name and devPrivate */
-            for (i = 0; i < pScrPriv->numOutputs; i++) {
-                RROutputPtr existing = pScrPriv->outputs[i];
-                if (existing && existing->devPrivate == output &&
-                    existing->nameLength == strlen(output->name) &&
-                    strncmp(existing->name, output->name, existing->nameLength) == 0) {
-                    output->randr_output = existing;
-                    break;
-                }
-            }
-
-            /* If not found, create a new one */
-            if (!output->randr_output) {
-                output->randr_output = RROutputCreate(pScreen, output->name,
-                                                      strlen(output->name), output);
-            }
+        if (!output->randr_output && !found_existing) {
+            output->randr_output = RROutputCreate(pScreen, output->name,
+                                                  strlen(output->name), output);
         }
 
         if (output->randr_output) {
