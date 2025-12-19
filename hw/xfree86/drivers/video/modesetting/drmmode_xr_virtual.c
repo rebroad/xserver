@@ -502,14 +502,34 @@ drmmode_xr_manager_set_property(xf86OutputPtr output, Atom property,
             return FALSE;
         }
 
-        drmmode_xr_create_virtual_output(pScrn, drmmode, name, width, height, refresh);
+        if (drmmode_xr_create_virtual_output(pScrn, drmmode, name, width, height, refresh)) {
+            xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                       "Successfully created virtual output '%s'\n", name);
+            free(command);
+            return TRUE;
+        } else {
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                       "Failed to create virtual output '%s'\n", name);
+            free(command);
+            return FALSE;
+        }
     } else if (strcmp(prop_name, XR_DELETE_OUTPUT_PROPERTY) == 0) {
         /* Format: "XR-0" */
-        drmmode_xr_delete_virtual_output(pScrn, command);
+        if (drmmode_xr_delete_virtual_output(pScrn, command)) {
+            xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                       "Successfully deleted virtual output '%s'\n", command);
+            free(command);
+            return TRUE;
+        } else {
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                       "Failed to delete virtual output '%s'\n", command);
+            free(command);
+            return FALSE;
+        }
     }
 
     free(command);
-    return TRUE;
+    return FALSE;
 }
 
 /**
