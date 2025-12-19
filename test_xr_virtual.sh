@@ -39,18 +39,26 @@ fi
 echo "✓ Sudo access confirmed"
 echo ""
 
-# Build Xorg if not already built
+# Build Xorg and required modules if not already built
 if [ ! -f "$BUILD_DIR/hw/xfree86/Xorg" ]; then
     echo "Building Xorg..."
     cd "$XSRC_DIR"
     ninja -C build hw/xfree86/Xorg
 fi
 
+# Build shadow module (needed by modesetting driver)
+if [ ! -f "$BUILD_DIR/hw/xfree86/dixmods/libshadow.so" ]; then
+    echo "Building shadow module..."
+    cd "$XSRC_DIR"
+    ninja -C build hw/xfree86/dixmods/libshadow.so
+fi
+
 # Use the driver directly from the build directory - no copying needed!
 # The driver is at: build/hw/xfree86/drivers/modesetting/modesetting_drv.so
-# Xorg's module loader looks in subdirectories like "drivers/", so we point
-# modulepath to the parent directory: build/hw/xfree86/drivers/
-TEST_DRIVER_DIR="$BUILD_DIR/hw/xfree86/drivers"
+# Xorg's module loader looks in subdirectories like "drivers/", "dixmods/", etc.
+# We need to point modulepath to the base module directory: build/hw/xfree86/
+# This allows Xorg to find both drivers (in drivers/) and other modules (in dixmods/, etc.)
+TEST_DRIVER_DIR="$BUILD_DIR/hw/xfree86"
 
 # Check if driver needs to be rebuilt (source is newer than built driver)
 DRIVER_SRC="$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_xr_virtual.c"
@@ -169,11 +177,10 @@ fi
 # 3. Security restrictions
 # 4. The driver needs to be in system location
 
-# For now, let's try with more verbose logging and see if we can get more info
 # IMPORTANT: Use -novtswitch to prevent this X server from switching VTs
 # This should prevent it from interfering with the running X server on VT7
+# Start Xorg in background - we'll monitor it and kill it if it hangs
 sudo env LD_LIBRARY_PATH="$BUILD_DIR:$LD_LIBRARY_PATH" \
-    LD_DEBUG=libs \
     "$XORG_BIN" "$TEST_DISPLAY" \
     -config /tmp/test-xorg.conf \
     -modulepath "$TEST_DRIVER_DIR" \
@@ -186,8 +193,9 @@ sudo env LD_LIBRARY_PATH="$BUILD_DIR:$LD_LIBRARY_PATH" \
 XORG_PID=$!
 
 # Wait for Xorg to start (check if process is still running)
-echo "Waiting for Xorg to start..."
-for i in {1..10}; do
+echo "Waiting for Xorg to start (max 15 seconds)..."
+XORG_STARTED=0
+for i in {1..15}; do
     sleep 1
     if ! kill -0 $XORG_PID 2>/dev/null; then
         echo "ERROR: Xorg process died. Check logs:"
@@ -200,15 +208,26 @@ for i in {1..10}; do
         exit 1
     fi
     # Check if X server is responding
-    if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
+    if DISPLAY="$TEST_DISPLAY" timeout 2 xdpyinfo >/dev/null 2>&1; then
         echo "✓ Xorg is responding"
+        XORG_STARTED=1
         break
     fi
-    if [ $i -eq 10 ]; then
-        echo "WARNING: Xorg started but not responding after 10 seconds"
-        echo "The server may still be initializing. Continuing with tests..."
+    if [ $i -eq 15 ]; then
+        echo "WARNING: Xorg started but not responding after 15 seconds"
+        echo "Killing Xorg to prevent system lockup..."
+        sudo kill -9 $XORG_PID 2>/dev/null || true
+        echo "Check logs:"
+        tail -50 "$TEST_LOG" 2>/dev/null || echo "(log file not found)"
+        exit 1
     fi
 done
+
+if [ $XORG_STARTED -eq 0 ]; then
+    echo "ERROR: Xorg failed to start properly"
+    sudo kill -9 $XORG_PID 2>/dev/null || true
+    exit 1
+fi
 
 echo "Xorg started (PID: $XORG_PID)"
 echo ""
@@ -242,8 +261,12 @@ fi
 
 echo ""
 echo "=== Cleanup ==="
-echo "To stop Xorg, run: sudo kill $XORG_PID"
-echo "Or switch to VT $TEST_VT and press Ctrl+Alt+Backspace"
-echo ""
-echo "Test complete. Xorg is still running on $TEST_DISPLAY"
+echo "Stopping Xorg..."
+sudo kill $XORG_PID 2>/dev/null || true
+sleep 1
+if kill -0 $XORG_PID 2>/dev/null; then
+    echo "Force killing Xorg..."
+    sudo kill -9 $XORG_PID 2>/dev/null || true
+fi
+echo "Test complete."
 
