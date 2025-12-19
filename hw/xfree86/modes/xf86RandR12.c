@@ -1757,13 +1757,34 @@ xf86RandR12CreateObjects12(ScreenPtr pScreen)
      */
     for (o = 0; o < config->num_output; o++) {
         xf86OutputPtr output = config->output[o];
+        rrScrPrivPtr pScrPriv = rrGetScrPriv(pScreen);
+        int i;
 
-        output->randr_output = RROutputCreate(pScreen, output->name,
-                                              strlen(output->name), output);
+        /* Only create RandR output if it doesn't already exist */
+        if (!output->randr_output) {
+            /* Try to find existing RandR output with same name and devPrivate */
+            for (i = 0; i < pScrPriv->numOutputs; i++) {
+                RROutputPtr existing = pScrPriv->outputs[i];
+                if (existing && existing->devPrivate == output &&
+                    existing->nameLength == strlen(output->name) &&
+                    strncmp(existing->name, output->name, existing->nameLength) == 0) {
+                    output->randr_output = existing;
+                    break;
+                }
+            }
 
-        if (output->funcs->create_resources != NULL)
-            output->funcs->create_resources(output);
-        RRPostPendingProperties(output->randr_output);
+            /* If not found, create a new one */
+            if (!output->randr_output) {
+                output->randr_output = RROutputCreate(pScreen, output->name,
+                                                      strlen(output->name), output);
+            }
+        }
+
+        if (output->randr_output) {
+            if (output->funcs->create_resources != NULL)
+                output->funcs->create_resources(output);
+            RRPostPendingProperties(output->randr_output);
+        }
     }
 
     if (config->name) {
