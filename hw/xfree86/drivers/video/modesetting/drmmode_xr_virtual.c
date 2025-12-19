@@ -209,11 +209,18 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
     modesettingPtr ms = modesettingPTR(pScrn);
     xf86OutputPtr output = ms->xr_virtual_output;
 
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "drmmode_xr_virtual_output_post_screen_init: called\n");
+
     if (!output) {
         xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
                    "Virtual XR output not found in post_screen_init\n");
         return FALSE;
     }
+
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "drmmode_xr_virtual_output_post_screen_init: output found, randr_output=%p\n",
+               output->randr_output);
 
     /* If RandR output already exists, skip creating it again.
      * This can happen if xf86RandR12CreateObjects12 already created it. */
