@@ -240,7 +240,6 @@ EOF
 
 # Start Xorg with our driver on a separate VT
 echo "Starting Xorg on $TEST_DISPLAY (VT $TEST_VT)..."
-echo "You may need to switch to VT $TEST_VT (Ctrl+Alt+F$TEST_VT) to see it"
 echo ""
 
 # Start Xorg in background (sudo password should be cached now)
@@ -367,30 +366,85 @@ fi
 
 echo ""
 echo "=== Test 6: Verify graphics are working ==="
-echo "Running a simple X test (xeyes or xclock)..."
-if command -v xeyes >/dev/null 2>&1; then
-    DISPLAY="$TEST_DISPLAY" timeout 2 xeyes >/dev/null 2>&1 &
-    XEYES_PID=$!
-    sleep 1
-    if kill -0 $XEYES_PID 2>/dev/null; then
-        echo "✓ Graphics test started (xeyes)"
-        kill $XEYES_PID 2>/dev/null || true
+echo "Testing X11 graphics capabilities..."
+echo "Note: Without a window manager, windows may not be visible or properly positioned."
+echo "If you're on VT $TEST_VT, you should see a test window briefly."
+
+# Test 1: Simple X11 drawing test using xdpyinfo (already verified X server works)
+if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
+    echo "✓ X server is responding to X11 protocol"
+else
+    echo "✗ X server not responding"
+fi
+
+# Test 2: Try to create a simple window and draw to it
+if command -v xlogo >/dev/null 2>&1; then
+    echo "Starting xlogo test (will run for 8 seconds)..."
+    echo "Note: Without a window manager, the window may not be visible or may be off-screen."
+    DISPLAY="$TEST_DISPLAY" xlogo -geometry 300x300+50+50 >/tmp/xlogo_test.log 2>&1 &
+    XLOGO_PID=$!
+    sleep 8
+    if kill -0 $XLOGO_PID 2>/dev/null; then
+        echo "✓ xlogo started and is running (PID: $XLOGO_PID)"
+        kill $XLOGO_PID 2>/dev/null || true
+        wait $XLOGO_PID 2>/dev/null || true
+        if [ -s /tmp/xlogo_test.log ]; then
+            echo "  xlogo output:"
+            cat /tmp/xlogo_test.log | head -5
+        fi
     else
-        echo "✗ Graphics test failed"
+        echo "✗ xlogo failed to start or crashed"
+        if [ -s /tmp/xlogo_test.log ]; then
+            echo "  Error output:"
+            cat /tmp/xlogo_test.log
+        fi
+    fi
+elif command -v xeyes >/dev/null 2>&1; then
+    echo "Starting xeyes test (will run for 8 seconds)..."
+    echo "Note: Without a window manager, the window may not be visible or may be off-screen."
+    DISPLAY="$TEST_DISPLAY" xeyes -geometry 300x300+50+50 >/tmp/xeyes_test.log 2>&1 &
+    XEYES_PID=$!
+    sleep 8
+    if kill -0 $XEYES_PID 2>/dev/null; then
+        echo "✓ xeyes started and is running (PID: $XEYES_PID)"
+        kill $XEYES_PID 2>/dev/null || true
+        wait $XEYES_PID 2>/dev/null || true
+        if [ -s /tmp/xeyes_test.log ]; then
+            echo "  xeyes output:"
+            cat /tmp/xeyes_test.log | head -5
+        fi
+    else
+        echo "✗ xeyes failed to start or crashed"
+        if [ -s /tmp/xeyes_test.log ]; then
+            echo "  Error output:"
+            cat /tmp/xeyes_test.log
+        fi
     fi
 elif command -v xclock >/dev/null 2>&1; then
-    DISPLAY="$TEST_DISPLAY" timeout 2 xclock >/dev/null 2>&1 &
+    echo "Starting xclock test (will run for 8 seconds)..."
+    echo "Note: Without a window manager, the window may not be visible or may be off-screen."
+    DISPLAY="$TEST_DISPLAY" xclock -geometry 300x300+50+50 >/tmp/xclock_test.log 2>&1 &
     XCLOCK_PID=$!
-    sleep 1
+    sleep 8
     if kill -0 $XCLOCK_PID 2>/dev/null; then
-        echo "✓ Graphics test started (xclock)"
+        echo "✓ xclock started and is running (PID: $XCLOCK_PID)"
         kill $XCLOCK_PID 2>/dev/null || true
+        wait $XCLOCK_PID 2>/dev/null || true
+        if [ -s /tmp/xclock_test.log ]; then
+            echo "  xclock output:"
+            cat /tmp/xclock_test.log | head -5
+        fi
     else
-        echo "✗ Graphics test failed"
+        echo "✗ xclock failed to start or crashed"
+        if [ -s /tmp/xclock_test.log ]; then
+            echo "  Error output:"
+            cat /tmp/xclock_test.log
+        fi
     fi
 else
-    echo "Note: xeyes/xclock not available, skipping graphics test"
+    echo "Note: xlogo/xeyes/xclock not available, skipping interactive graphics test"
     echo "The black screen is normal - there's no window manager running"
+    echo "Graphics capability is verified by X server responding to X11 protocol"
 fi
 
 echo ""
