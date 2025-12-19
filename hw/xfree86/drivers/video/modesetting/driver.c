@@ -2041,10 +2041,6 @@ ScreenInit(ScreenPtr pScreen, int argc, char **argv)
         return FALSE;
     }
 
-    /* Don't initialize RandR here - xf86CrtcScreenInit will do it.
-     * We'll create the virtual XR RandR output AFTER xf86CrtcScreenInit
-     * has initialized RandR and processed all real outputs. */
-
     if (ms->drmmode.shadow_enable && !ms->shadow.Setup(pScreen)) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "shadow fb init failed\n");
         return FALSE;
