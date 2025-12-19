@@ -55,16 +55,32 @@ drmmode_xr_virtual_ensure_ar_mode_property(ScrnInfoPtr pScrn, RROutputPtr randr_
     INT32 value = 0;
     int err;
 
-    if (name == BAD_RESOURCE || RRQueryOutputProperty(randr_output, name))
-        return name != BAD_RESOURCE;
-
-    if ((err = RRConfigureOutputProperty(randr_output, name, FALSE, FALSE, TRUE, 1, &value)) != 0 ||
-        (err = RRChangeOutputProperty(randr_output, name, XA_INTEGER, 32, PropModeReplace, 1,
-                                       &value, FALSE, FALSE)) != 0) {
-        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to %s AR_MODE property: %d\n",
-                   err == 0 ? "set" : "configure", err);
+    if (name == BAD_RESOURCE) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to create AR_MODE atom\n");
         return FALSE;
     }
+
+    /* Check if property already exists */
+    if (RRQueryOutputProperty(randr_output, name)) {
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO, "AR_MODE property already exists\n");
+        return TRUE;
+    }
+
+    /* Property doesn't exist, create it */
+    err = RRConfigureOutputProperty(randr_output, name, FALSE, FALSE, TRUE, 1, &value);
+    if (err != 0) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to configure AR_MODE property: %d\n", err);
+        return FALSE;
+    }
+
+    err = RRChangeOutputProperty(randr_output, name, XA_INTEGER, 32, PropModeReplace, 1,
+                                   &value, FALSE, FALSE);
+    if (err != 0) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to set AR_MODE property: %d\n", err);
+        return FALSE;
+    }
+
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO, "AR_MODE property created successfully\n");
     return TRUE;
 }
 
