@@ -44,6 +44,30 @@ extern const xf86OutputFuncsRec drmmode_output_funcs;
 #define XR_VIRTUAL_OUTPUT_NAME "XR-0"
 #define XR_AR_MODE_PROPERTY "AR_MODE"
 
+/* Get AR_MODE property atom - use macro to avoid function call overhead */
+#define XR_AR_MODE_ATOM() MakeAtom(XR_AR_MODE_PROPERTY, strlen(XR_AR_MODE_PROPERTY), TRUE)
+
+/* Create or ensure AR_MODE property exists on the output */
+static Bool
+drmmode_xr_virtual_ensure_ar_mode_property(ScrnInfoPtr pScrn, RROutputPtr randr_output)
+{
+    Atom name = XR_AR_MODE_ATOM();
+    INT32 value = 0;
+    int err;
+
+    if (name == BAD_RESOURCE || RRQueryOutputProperty(randr_output, name))
+        return name != BAD_RESOURCE;
+
+    if ((err = RRConfigureOutputProperty(randr_output, name, FALSE, FALSE, TRUE, 1, &value)) != 0 ||
+        (err = RRChangeOutputProperty(randr_output, name, XA_INTEGER, 32, PropModeReplace, 1,
+                                       &value, FALSE, FALSE)) != 0) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to %s AR_MODE property: %d\n",
+                   err == 0 ? "set" : "configure", err);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /* No-op create_resources for virtual output (doesn't have a real DRM connector) */
 static void
 drmmode_xr_virtual_create_resources(xf86OutputPtr output)
@@ -222,11 +246,16 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
                "drmmode_xr_virtual_output_post_screen_init: output found, randr_output=%p\n",
                output->randr_output);
 
-    /* If RandR output already exists, skip creating it again.
-     * This can happen if xf86RandR12CreateObjects12 already created it. */
+    /* If RandR output already exists (created by xf86RandR12CreateObjects12),
+     * we still need to set up the AR_MODE property and modes */
     if (output->randr_output) {
         /* Make sure modes are set */
         drmmode_xr_virtual_set_modes(output);
+
+        /* Create AR_MODE property if it doesn't exist */
+        drmmode_xr_virtual_ensure_ar_mode_property(pScrn, output->randr_output);
+
+        RRPostPendingProperties(output->randr_output);
         return TRUE;
     }
 
@@ -242,28 +271,7 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
     }
 
     /* Create AR_MODE property */
-    {
-        Atom name = MakeAtom(XR_AR_MODE_PROPERTY, strlen(XR_AR_MODE_PROPERTY), TRUE);
-        INT32 value = 0; /* AR mode disabled by default */
-
-        if (name != BAD_RESOURCE) {
-            int err = RRConfigureOutputProperty(output->randr_output, name,
-                                                FALSE, FALSE, TRUE,
-                                                1, &value);
-            if (err != 0) {
-                xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                           "Failed to configure AR_MODE property: %d\n", err);
-            } else {
-                err = RRChangeOutputProperty(output->randr_output, name,
-                                             XA_INTEGER, 32, PropModeReplace, 1,
-                                             &value, FALSE, FALSE);
-                if (err != 0) {
-                    xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                               "Failed to set AR_MODE property: %d\n", err);
-                }
-            }
-        }
-    }
+    drmmode_xr_virtual_ensure_ar_mode_property(pScrn, output->randr_output);
 
     /* Set modes for the output */
     drmmode_xr_virtual_set_modes(output);
@@ -317,7 +325,7 @@ drmmode_xr_get_ar_mode(ScrnInfoPtr pScrn)
         return FALSE;
 
     /* Read AR_MODE property from RandR output */
-    Atom prop = MakeAtom(XR_AR_MODE_PROPERTY, strlen(XR_AR_MODE_PROPERTY), TRUE);
+    Atom prop = XR_AR_MODE_ATOM();
     if (prop == BAD_RESOURCE)
         return FALSE;
 
@@ -387,7 +395,7 @@ drmmode_xr_set_ar_mode(ScrnInfoPtr pScrn, Bool enabled)
     if (!output || !output->randr_output)
         return FALSE;
 
-    Atom prop = MakeAtom(XR_AR_MODE_PROPERTY, strlen(XR_AR_MODE_PROPERTY), TRUE);
+    Atom prop = XR_AR_MODE_ATOM();
     if (prop == BAD_RESOURCE)
         return FALSE;
 
