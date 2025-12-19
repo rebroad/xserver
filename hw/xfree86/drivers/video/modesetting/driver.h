@@ -153,9 +153,10 @@ typedef struct _modesettingRec {
     uint32_t connector_prop_id;
 
     /* Virtual XR connector support */
-    Bool xr_virtual_enabled;      /* Virtual XR connector (XR-0) is enabled */
+    Bool xr_virtual_enabled;      /* Virtual XR connector support is enabled */
     Bool xr_ar_mode;               /* AR mode: hide physical XR, show virtual XR */
-    xf86OutputPtr xr_virtual_output; /* Pointer to virtual XR output */
+    xf86OutputPtr xr_manager_output; /* XR-Manager control output (always disconnected) */
+    void *xr_virtual_outputs;     /* Linked list of dynamically created virtual outputs */
     xf86CrtcPtr xr_virtual_crtc;   /* CRTC for virtual XR connector */
 
     /* shadow API */
