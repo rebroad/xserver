@@ -37,8 +37,9 @@
 #include "drmmode_display.h"
 #include "driver.h"
 
-/* Forward declaration - this function is in drmmode_display.c */
+/* Forward declarations - these functions/objects are in drmmode_display.c */
 extern void drmmode_output_create_resources(xf86OutputPtr output);
+extern const xf86OutputFuncsRec drmmode_output_funcs;
 
 #define XR_VIRTUAL_OUTPUT_NAME "XR-0"
 #define XR_AR_MODE_PROPERTY "AR_MODE"
@@ -61,8 +62,6 @@ drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
         return TRUE;
 
     /* Create the output using the same function table as regular outputs */
-    /* Note: drmmode_output_funcs is now exported (non-static) */
-    extern const xf86OutputFuncsRec drmmode_output_funcs;
     output = xf86OutputCreate(pScrn, &drmmode_output_funcs, XR_VIRTUAL_OUTPUT_NAME);
     if (!output) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
@@ -100,7 +99,41 @@ drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
         output->probed_modes = xf86ModesAdd(output->probed_modes, mode);
     }
 
-    /* Create RandR output */
+    /* Don't create RandR output here - the screen doesn't exist yet.
+     * We'll create it in drmmode_xr_virtual_output_post_screen_init() */
+    output->randr_output = NULL;
+
+    /* Store reference */
+    ms->xr_virtual_output = output;
+    ms->xr_virtual_enabled = FALSE; /* Disabled by default */
+    ms->xr_ar_mode = FALSE;
+
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "Virtual XR connector (XR-0) created (RandR output will be created after screen init)\n");
+
+    return TRUE;
+}
+
+/**
+ * Create RandR output for virtual XR connector after screen is initialized.
+ * This must be called from ScreenInit or later, when the screen exists.
+ */
+Bool
+drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
+{
+    modesettingPtr ms = modesettingPTR(pScrn);
+    xf86OutputPtr output = ms->xr_virtual_output;
+
+    if (!output) {
+        return FALSE;
+    }
+
+    /* If RandR output already exists, we're done */
+    if (output->randr_output) {
+        return TRUE;
+    }
+
+    /* Now we can safely create the RandR output - screen exists */
     output->randr_output = RROutputCreate(xf86ScrnToScreen(pScrn),
                                           XR_VIRTUAL_OUTPUT_NAME,
                                           strlen(XR_VIRTUAL_OUTPUT_NAME),
@@ -108,8 +141,6 @@ drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
     if (!output->randr_output) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
                    "Failed to create RandR output for virtual XR\n");
-        free(drmmode_output);
-        xf86OutputDestroy(output);
         return FALSE;
     }
 
@@ -141,13 +172,8 @@ drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
     drmmode_output_create_resources(output);
     RRPostPendingProperties(output->randr_output);
 
-    /* Store reference */
-    ms->xr_virtual_output = output;
-    ms->xr_virtual_enabled = FALSE; /* Disabled by default */
-    ms->xr_ar_mode = FALSE;
-
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Virtual XR connector (XR-0) created\n");
+               "Virtual XR connector (XR-0) RandR output created\n");
 
     return TRUE;
 }
@@ -155,7 +181,7 @@ drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
 /**
  * Clean up virtual XR connector
  */
-static void
+void
 drmmode_xr_virtual_output_fini(ScrnInfoPtr pScrn)
 {
     modesettingPtr ms = modesettingPTR(pScrn);
@@ -180,7 +206,7 @@ drmmode_xr_virtual_output_fini(ScrnInfoPtr pScrn)
 /**
  * Check if AR mode is enabled for the virtual XR connector
  */
-static Bool
+Bool
 drmmode_xr_get_ar_mode(ScrnInfoPtr pScrn)
 {
     modesettingPtr ms = modesettingPTR(pScrn);
@@ -203,7 +229,7 @@ drmmode_xr_get_ar_mode(ScrnInfoPtr pScrn)
  * Add a mode to the virtual XR connector
  * Called by Breezy when enabling the connector with specific dimensions
  */
-static Bool
+Bool
 drmmode_xr_add_mode(ScrnInfoPtr pScrn, int width, int height, int refresh)
 {
     modesettingPtr ms = modesettingPTR(pScrn);
@@ -251,7 +277,7 @@ drmmode_xr_add_mode(ScrnInfoPtr pScrn, int width, int height, int refresh)
 /**
  * Set AR mode for the virtual XR connector
  */
-static Bool
+Bool
 drmmode_xr_set_ar_mode(ScrnInfoPtr pScrn, Bool enabled)
 {
     modesettingPtr ms = modesettingPTR(pScrn);

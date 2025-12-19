@@ -2040,6 +2040,9 @@ ScreenInit(ScreenPtr pScreen, int argc, char **argv)
         return FALSE;
     }
 
+    /* Create RandR output for virtual XR connector now that screen exists */
+    drmmode_xr_virtual_output_post_screen_init(pScrn);
+
     if (ms->drmmode.shadow_enable && !ms->shadow.Setup(pScreen)) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "shadow fb init failed\n");
         return FALSE;

@@ -21,7 +21,7 @@ shared_module(
     name_prefix: '',
 
     include_directories: [inc, xorg_inc],
-    c_args: xorg_c_args,
+    c_args: xorg_c_args + ['-Werror'],
     dependencies: [
         common_dep,
         egl_dep,
