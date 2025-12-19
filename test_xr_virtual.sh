@@ -178,29 +178,41 @@ TEST_DRIVER_DIR="$BUILD_DIR/hw/xfree86"
 DRIVER_SRC="$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_xr_virtual.c"
 DRIVER_BUILD="$BUILD_DIR/hw/xfree86/drivers/modesetting/modesetting_drv.so"
 RANDR_SRC="$XSRC_DIR/hw/xfree86/modes/xf86RandR12.c"
+XORG_BIN="$BUILD_DIR/hw/xfree86/Xorg"
 
-NEEDS_REBUILD=0
+NEEDS_DRIVER_REBUILD=0
+NEEDS_XORG_REBUILD=0
 
+# Check if driver needs rebuilding
 if [ ! -f "$DRIVER_BUILD" ]; then
     echo "Driver not found, building..."
-    NEEDS_REBUILD=1
+    NEEDS_DRIVER_REBUILD=1
 elif [ -f "$DRIVER_SRC" ] && [ "$DRIVER_SRC" -nt "$DRIVER_BUILD" ]; then
     echo "Driver source (drmmode_xr_virtual.c) is newer than built driver, rebuilding..."
-    NEEDS_REBUILD=1
-elif [ -f "$RANDR_SRC" ] && [ "$RANDR_SRC" -nt "$DRIVER_BUILD" ]; then
-    echo "RandR source (xf86RandR12.c) is newer than built driver, rebuilding..."
-    NEEDS_REBUILD=1
+    NEEDS_DRIVER_REBUILD=1
 elif [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/driver.c" -nt "$DRIVER_BUILD" ] 2>/dev/null || \
      [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_display.c" -nt "$DRIVER_BUILD" ] 2>/dev/null || \
      [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_display.h" -nt "$DRIVER_BUILD" ] 2>/dev/null; then
     echo "Driver source files are newer than built driver, rebuilding..."
-    NEEDS_REBUILD=1
+    NEEDS_DRIVER_REBUILD=1
 fi
 
-if [ $NEEDS_REBUILD -eq 1 ]; then
+# Check if Xorg needs rebuilding (xf86RandR12.c is part of Xorg, not the driver)
+if [ -f "$RANDR_SRC" ] && [ -f "$XORG_BIN" ] && [ "$RANDR_SRC" -nt "$XORG_BIN" ]; then
+    echo "RandR source (xf86RandR12.c) is newer than built Xorg, rebuilding Xorg..."
+    NEEDS_XORG_REBUILD=1
+fi
+
+# Rebuild what's needed
+if [ $NEEDS_DRIVER_REBUILD -eq 1 ] || [ $NEEDS_XORG_REBUILD -eq 1 ]; then
     cd "$XSRC_DIR"
-    # Rebuild both the driver and Xorg (since xf86RandR12.c is part of Xorg)
-    ninja -C build hw/xfree86/drivers/modesetting/modesetting_drv.so hw/xfree86/Xorg
+    if [ $NEEDS_DRIVER_REBUILD -eq 1 ] && [ $NEEDS_XORG_REBUILD -eq 1 ]; then
+        ninja -C build hw/xfree86/drivers/modesetting/modesetting_drv.so hw/xfree86/Xorg
+    elif [ $NEEDS_DRIVER_REBUILD -eq 1 ]; then
+        ninja -C build hw/xfree86/drivers/modesetting/modesetting_drv.so
+    elif [ $NEEDS_XORG_REBUILD -eq 1 ]; then
+        ninja -C build hw/xfree86/Xorg
+    fi
 fi
 
 # Verify the driver exists after potential rebuild
@@ -345,6 +357,7 @@ XORG_START_TIME=$(date +%s)
 # Wait for Xorg to start (check if process is still running)
 echo "Waiting for Xorg to start (max 15 seconds)..."
 XORG_STARTED=0
+WAIT_START=$(date +%s)
 for i in {1..15}; do
     sleep 1
     if ! kill -0 $XORG_PID 2>/dev/null; then
@@ -359,8 +372,11 @@ for i in {1..15}; do
     fi
     # Check if X server is responding
     if DISPLAY="$TEST_DISPLAY" timeout 2 xdpyinfo >/dev/null 2>&1; then
-        echo "✓ Xorg is responding"
+        WAIT_END=$(date +%s)
+        WAIT_DURATION=$((WAIT_END - WAIT_START))
+        echo "✓ Xorg is responding (took ${WAIT_DURATION} seconds)"
         XORG_STARTED=1
+        export WAIT_DURATION WAIT_START  # Export for use in XLogo section
         break
     fi
     if [ $i -eq 15 ]; then
@@ -379,6 +395,12 @@ if [ $XORG_STARTED -eq 0 ]; then
     exit 1
 fi
 
+# Ensure WAIT_DURATION is set (in case loop didn't set it)
+if [ -z "$WAIT_DURATION" ]; then
+    WAIT_END=$(date +%s)
+    WAIT_DURATION=$((WAIT_END - WAIT_START))
+fi
+
 echo "Xorg started (PID: $XORG_PID)"
 echo ""
 
@@ -386,12 +408,11 @@ echo ""
 XLOGO_PIDS=""
 WM_PID=""
 if command -v xlogo >/dev/null 2>&1; then
+    XLOGO_START_TIME=$(date +%s)
     echo "Starting XLogo immediately for visual feedback..."
-    # Wait a moment for Xorg to fully initialize outputs
-    sleep 1
-
-    # Get list of connected outputs with their positions
-    OUTPUT_INFO=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | awk '{
+    # Try to get outputs immediately - if xrandr isn't ready yet, wait briefly and retry
+    # Extract output positions from xrandr output
+    XRANDR_AWK_SCRIPT='{
         output=$1
         match($0, /\+[0-9]+\+[0-9]+/)
         if (RSTART > 0) {
@@ -403,10 +424,22 @@ if command -v xlogo >/dev/null 2>&1; then
         } else {
             print output " 0 0"
         }
-    }')
+    }'
 
+    XRANDR_START=$(date +%s)
+    OUTPUT_INFO=$(DISPLAY="$TEST_DISPLAY" timeout 1 xrandr 2>/dev/null | grep -E " connected" | awk "$XRANDR_AWK_SCRIPT")
+    XRANDR_END=$(date +%s)
+    XRANDR_DURATION=$((XRANDR_END - XRANDR_START))
+
+    # If no outputs found, wait briefly for RandR to finish probing and retry
     if [ -z "$OUTPUT_INFO" ]; then
-        OUTPUTS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | awk '{print $1}' | head -3)
+        sleep 0.5  # Only wait if outputs aren't ready yet
+        OUTPUT_INFO=$(DISPLAY="$TEST_DISPLAY" timeout 1 xrandr 2>/dev/null | grep -E " connected" | awk "$XRANDR_AWK_SCRIPT")
+    fi
+
+    # Fallback: try to get any outputs without position info
+    if [ -z "$OUTPUT_INFO" ]; then
+        OUTPUTS=$(DISPLAY="$TEST_DISPLAY" timeout 1 xrandr 2>/dev/null | grep -E "^[A-Z]" | awk '{print $1}' | head -3)
         if [ -n "$OUTPUTS" ]; then
             OUTPUT_INFO=""
             for output in $OUTPUTS; do
@@ -427,7 +460,10 @@ if command -v xlogo >/dev/null 2>&1; then
             XLOGO_PIDS=$(cat /tmp/xlogo_pids.txt | tr '\n' ' ')
             rm -f /tmp/xlogo_pids.txt
         fi
+        XLOGO_END_TIME=$(date +%s)
+        XLOGO_TOTAL_DURATION=$((XLOGO_END_TIME - XLOGO_START_TIME))
         echo "✓ XLogo started (PIDs:$XLOGO_PIDS) - windows should be visible now"
+        echo "  Timing: Xorg startup ${WAIT_DURATION}s, xrandr query ${XRANDR_DURATION}s, XLogo launch ${XLOGO_TOTAL_DURATION}s total"
     fi
 fi
 echo ""
@@ -436,6 +472,9 @@ echo ""
 echo "=== Test 1: Check if XR-0 appears in xrandr ==="
 echo "All outputs:"
 DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" || DISPLAY="$TEST_DISPLAY" xrandr 2>&1
+echo ""
+echo "Note: 'Screen 0' shows the combined screen space (all outputs together)."
+echo "      Your setup: eDP-1 (1920x1080) + DP-1 (1920x1080) = 3840x1080 total"
 echo ""
 if DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -i "XR-0" >/dev/null; then
     echo "✓ XR-0 found!"
