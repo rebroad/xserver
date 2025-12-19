@@ -60,6 +60,7 @@
 #include "edid.h"
 #include "xf86i2c.h"
 #include "xf86Crtc.h"
+#include "xf86RandR12.h"
 #include "miscstruct.h"
 #include "dixstruct.h"
 #include "xf86xv.h"
@@ -2040,8 +2041,9 @@ ScreenInit(ScreenPtr pScreen, int argc, char **argv)
         return FALSE;
     }
 
-    /* Create RandR output for virtual XR connector now that screen exists */
-    drmmode_xr_virtual_output_post_screen_init(pScrn);
+    /* Don't initialize RandR here - xf86CrtcScreenInit will do it.
+     * We'll create the virtual XR RandR output AFTER xf86CrtcScreenInit
+     * has initialized RandR and processed all real outputs. */
 
     if (ms->drmmode.shadow_enable && !ms->shadow.Setup(pScreen)) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "shadow fb init failed\n");
@@ -2112,6 +2114,10 @@ ScreenInit(ScreenPtr pScreen, int argc, char **argv)
 
     if (!xf86CrtcScreenInit(pScreen))
         return FALSE;
+
+    /* Create RandR output for virtual XR connector AFTER xf86CrtcScreenInit
+     * has initialized RandR and processed all real outputs */
+    drmmode_xr_virtual_output_post_screen_init(pScrn);
 
     if (!drmmode_setup_colormap(pScreen, pScrn))
         return FALSE;

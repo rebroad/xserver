@@ -44,6 +44,26 @@ extern const xf86OutputFuncsRec drmmode_output_funcs;
 #define XR_VIRTUAL_OUTPUT_NAME "XR-0"
 #define XR_AR_MODE_PROPERTY "AR_MODE"
 
+/* No-op create_resources for virtual output (doesn't have a real DRM connector) */
+static void
+drmmode_xr_virtual_create_resources(xf86OutputPtr output)
+{
+    /* Virtual output doesn't need DRM-specific properties */
+    /* Modes and properties are set up in drmmode_xr_virtual_output_post_screen_init */
+}
+
+/* Custom function table for virtual XR output - initialized at runtime */
+static xf86OutputFuncsRec drmmode_xr_virtual_output_funcs;
+
+/* Initialize the virtual output function table (called once) */
+static void
+drmmode_xr_virtual_output_funcs_init(void)
+{
+    /* Copy from the regular output funcs, but override create_resources */
+    drmmode_xr_virtual_output_funcs = drmmode_output_funcs;
+    drmmode_xr_virtual_output_funcs.create_resources = drmmode_xr_virtual_create_resources;
+}
+
 /**
  * Create a virtual XR connector output.
  * This creates a synthetic RandR output that appears as "XR-0" in xrandr.
@@ -56,13 +76,20 @@ drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
     xf86OutputPtr output;
     drmmode_output_private_ptr drmmode_output;
     DisplayModePtr mode;
+    static Bool funcs_initialized = FALSE;
 
     /* Check if already initialized */
     if (ms->xr_virtual_output)
         return TRUE;
 
-    /* Create the output using the same function table as regular outputs */
-    output = xf86OutputCreate(pScrn, &drmmode_output_funcs, XR_VIRTUAL_OUTPUT_NAME);
+    /* Initialize function table on first call */
+    if (!funcs_initialized) {
+        drmmode_xr_virtual_output_funcs_init();
+        funcs_initialized = TRUE;
+    }
+
+    /* Create the output using a custom function table that has a no-op create_resources */
+    output = xf86OutputCreate(pScrn, &drmmode_xr_virtual_output_funcs, XR_VIRTUAL_OUTPUT_NAME);
     if (!output) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
                    "Failed to create virtual XR output\n");
@@ -115,6 +142,64 @@ drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
 }
 
 /**
+ * Set modes for the virtual XR output by converting DisplayModePtr to RRModePtr
+ */
+static void
+drmmode_xr_virtual_set_modes(xf86OutputPtr output)
+{
+    if (!output->randr_output || !output->probed_modes)
+        return;
+
+    DisplayModePtr mode;
+    RRModePtr *rrmodes = NULL;
+    int nmode = 0;
+    int npreferred = 0;
+
+    /* Count modes */
+    for (mode = output->probed_modes; mode; mode = mode->next)
+        nmode++;
+
+    if (nmode == 0)
+        return;
+
+    rrmodes = calloc(nmode, sizeof(RRModePtr));
+    if (!rrmodes)
+        return;
+
+    nmode = 0;
+    for (mode = output->probed_modes; mode; mode = mode->next) {
+        xRRModeInfo modeInfo;
+        RRModePtr rrmode;
+
+        modeInfo.nameLength = strlen(mode->name);
+        modeInfo.width = mode->HDisplay;
+        modeInfo.dotClock = mode->Clock * 1000;
+        modeInfo.hSyncStart = mode->HSyncStart;
+        modeInfo.hSyncEnd = mode->HSyncEnd;
+        modeInfo.hTotal = mode->HTotal;
+        modeInfo.hSkew = mode->HSkew;
+        modeInfo.height = mode->VDisplay;
+        modeInfo.vSyncStart = mode->VSyncStart;
+        modeInfo.vSyncEnd = mode->VSyncEnd;
+        modeInfo.vTotal = mode->VTotal;
+        modeInfo.modeFlags = mode->Flags;
+
+        rrmode = RRModeGet(&modeInfo, mode->name);
+        if (rrmode) {
+            rrmodes[nmode++] = rrmode;
+            if (mode->type & M_T_PREFERRED)
+                npreferred++;
+        }
+    }
+
+    if (nmode > 0) {
+        RROutputSetModes(output->randr_output, rrmodes, nmode, npreferred);
+    }
+
+    free(rrmodes);
+}
+
+/**
  * Create RandR output for virtual XR connector after screen is initialized.
  * This must be called from ScreenInit or later, when the screen exists.
  */
@@ -125,11 +210,16 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
     xf86OutputPtr output = ms->xr_virtual_output;
 
     if (!output) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "Virtual XR output not found in post_screen_init\n");
         return FALSE;
     }
 
-    /* If RandR output already exists, we're done */
+    /* If RandR output already exists, skip creating it again.
+     * This can happen if xf86RandR12CreateObjects12 already created it. */
     if (output->randr_output) {
+        /* Make sure modes are set */
+        drmmode_xr_virtual_set_modes(output);
         return TRUE;
     }
 
@@ -168,8 +258,12 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
         }
     }
 
-    /* Create resources and post properties */
-    drmmode_output_create_resources(output);
+    /* Set modes for the output */
+    drmmode_xr_virtual_set_modes(output);
+
+    /* Note: We do NOT call drmmode_output_create_resources() for the virtual output
+     * because it expects a real DRM connector (mode_output), which we don't have.
+     * The virtual output doesn't need DRM-specific properties. */
     RRPostPendingProperties(output->randr_output);
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
