@@ -630,8 +630,9 @@ LAPTOP_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "eDP.*conn
 
 if [ -n "$EXTERNAL_MONITOR" ] && [ -n "$LAPTOP_MONITOR" ]; then
     echo "Arranging displays: $EXTERNAL_MONITOR above $LAPTOP_MONITOR"
-    if DISPLAY="$TEST_DISPLAY" xrandr --output "$EXTERNAL_MONITOR" --above "$LAPTOP_MONITOR" 2>/dev/null; then
-        echo "✓ Displays arranged: $EXTERNAL_MONITOR above $LAPTOP_MONITOR"
+    # Use --auto to enable displays at their preferred/native resolution
+    if DISPLAY="$TEST_DISPLAY" xrandr --output "$EXTERNAL_MONITOR" --auto --above "$LAPTOP_MONITOR" --output "$LAPTOP_MONITOR" --auto 2>/dev/null; then
+        echo "✓ Displays arranged: $EXTERNAL_MONITOR above $LAPTOP_MONITOR (with native resolutions)"
     else
         echo "  Using explicit positioning..."
         EXTERNAL_HEIGHT=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "[0-9]+x[0-9]+" | head -1 | cut -dx -f2)
@@ -801,9 +802,36 @@ else
     echo "  ✗ Failed to create XR-1"
 fi
 
+# Enable the created XR outputs so they show as active (blue) in Display Settings
+echo ""
+echo "Enabling XR outputs so they appear active in Display Settings..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --auto 2>&1; then
+    echo "  ✓ XR-0 enabled"
+fi
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-1 --auto 2>&1; then
+    echo "  ✓ XR-1 enabled"
+fi
+sleep 1
+
 echo ""
 echo "Current outputs:"
 DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
+
+echo ""
+echo "XR outputs created. Please verify they appear in Display Settings before we proceed with resizing and deletion tests."
+echo "Note: Outputs are created as 'connected' so they should be visible in Display Settings."
+if command -v zenity >/dev/null 2>&1; then
+    DISPLAY="$TEST_DISPLAY" zenity --info --title "XR Output Test" \
+        --text "XR-0 and XR-1 have been created.\n\nPlease check Display Settings to verify they appear.\n\nClick OK when ready to proceed with resizing and deletion tests." \
+        2>/dev/null || echo "  (zenity dialog closed or failed)"
+elif command -v xmessage >/dev/null 2>&1; then
+    DISPLAY="$TEST_DISPLAY" xmessage -center -timeout 0 \
+        "XR-0 and XR-1 have been created. Please check Display Settings to verify they appear. Click OK when ready to proceed with resizing and deletion tests." \
+        2>/dev/null || echo "  (xmessage dialog closed)"
+else
+    echo "  Press Enter when ready to proceed with resizing and deletion tests..."
+    read -r
+fi
 
 echo ""
 echo "Resizing XR-0 to 3840x2160..."
@@ -813,31 +841,6 @@ if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_WIDTH 3840 2>&1 && \
     sleep 2
 else
     echo "  ✗ Failed to resize XR-0"
-fi
-
-echo ""
-echo "Arranging outputs..."
-echo "  Connecting XR-0..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --auto 2>&1; then
-    echo "  ✓ XR-0 connected"
-    sleep 1
-else
-    echo "  ⚠ Could not connect XR-0"
-fi
-
-echo ""
-echo "XR outputs created. Before testing deletion, please verify they appear in Display Settings."
-if command -v zenity >/dev/null 2>&1; then
-    DISPLAY="$TEST_DISPLAY" zenity --info --title "XR Output Test" \
-        --text "XR-0 and XR-1 have been created.\n\nPlease check Display Settings to verify they appear.\n\nClick OK when ready to test deletion of XR-1." \
-        2>/dev/null || echo "  (zenity dialog closed or failed)"
-elif command -v xmessage >/dev/null 2>&1; then
-    DISPLAY="$TEST_DISPLAY" xmessage -center -timeout 0 \
-        "XR-0 and XR-1 have been created. Please check Display Settings to verify they appear. Click OK when ready to test deletion of XR-1." \
-        2>/dev/null || echo "  (xmessage dialog closed)"
-else
-    echo "  Press Enter when ready to test deletion of XR-1..."
-    read -r
 fi
 
 echo ""
