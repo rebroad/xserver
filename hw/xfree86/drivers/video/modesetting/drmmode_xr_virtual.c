@@ -701,12 +701,26 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
     delete_atom = XR_DELETE_OUTPUT_ATOM();
 
     if (create_atom != BAD_RESOURCE) {
-        INT32 dummy = 0;
-        RRConfigureOutputProperty(output->randr_output, create_atom, FALSE, FALSE, FALSE, 1, &dummy);
+        /* Configure as mutable STRING property (pending=FALSE, range=FALSE, immutable=FALSE) */
+        char empty_str[] = "";
+        RRConfigureOutputProperty(output->randr_output, create_atom,
+                                 FALSE, FALSE, FALSE,
+                                 1, (unsigned char *)empty_str);
+        /* Set initial empty value as STRING */
+        RRChangeOutputProperty(output->randr_output, create_atom,
+                              XA_STRING, 8, PropModeReplace, 1,
+                              (unsigned char *)empty_str, FALSE, FALSE);
     }
     if (delete_atom != BAD_RESOURCE) {
-        INT32 dummy = 0;
-        RRConfigureOutputProperty(output->randr_output, delete_atom, FALSE, FALSE, FALSE, 1, &dummy);
+        /* Configure as mutable STRING property */
+        char empty_str[] = "";
+        RRConfigureOutputProperty(output->randr_output, delete_atom,
+                                 FALSE, FALSE, FALSE,
+                                 1, (unsigned char *)empty_str);
+        /* Set initial empty value as STRING */
+        RRChangeOutputProperty(output->randr_output, delete_atom,
+                              XA_STRING, 8, PropModeReplace, 1,
+                              (unsigned char *)empty_str, FALSE, FALSE);
     }
 
     RRPostPendingProperties(output->randr_output);
