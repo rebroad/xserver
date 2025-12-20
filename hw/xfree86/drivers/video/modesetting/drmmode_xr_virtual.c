@@ -286,8 +286,9 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
         return NULL;
     }
 
-    /* Set connection to disconnected initially (will be connected when enabled) */
-    RROutputSetConnection(output->randr_output, RR_Disconnected);
+    /* Set connection to connected so Display Settings can see it
+     * (even though it's virtual, we want it to appear as available) */
+    RROutputSetConnection(output->randr_output, RR_Connected);
 
     /* Set modes */
     drmmode_xr_virtual_set_modes(output, width, height, refresh);
