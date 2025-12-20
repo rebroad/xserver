@@ -579,9 +579,10 @@ sudo env LD_LIBRARY_PATH="$BUILD_DIR:$LD_LIBRARY_PATH" \
     > /tmp/Xorg_startup.log 2>&1 &
 XORG_PID=$!
 XORG_START_TIME=$(date +%s)
+echo "[$(date '+%H:%M:%S')] Xorg process started (PID: $XORG_PID)"
 
 # Wait for Xorg to start (check if process is still running)
-echo "Waiting for Xorg to start (max 15 seconds)..."
+echo "[$(date '+%H:%M:%S')] Waiting for Xorg to start (max 15 seconds)..."
 XORG_STARTED=0
 WAIT_START=$(date +%s)
 for i in {1..15}; do
@@ -600,7 +601,7 @@ for i in {1..15}; do
     if DISPLAY="$TEST_DISPLAY" timeout 2 xdpyinfo >/dev/null 2>&1; then
         WAIT_END=$(date +%s)
         WAIT_DURATION=$((WAIT_END - WAIT_START))
-        echo "✓ Xorg is responding (took ${WAIT_DURATION} seconds)"
+        echo "[$(date '+%H:%M:%S')] ✓ Xorg is responding (took ${WAIT_DURATION} seconds)"
         XORG_STARTED=1
         break
     fi
@@ -620,11 +621,11 @@ if [ $XORG_STARTED -eq 0 ]; then
     exit 1
 fi
 
-echo "Xorg started (PID: $XORG_PID)"
+echo "[$(date '+%H:%M:%S')] Xorg started (PID: $XORG_PID)"
 echo ""
 
 # Arrange displays first (before window manager and display settings)
-echo "=== Arranging displays (external monitor ABOVE laptop) ==="
+echo "[$(date '+%H:%M:%S')] === Arranging displays (external monitor ABOVE laptop) ==="
 EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
 LAPTOP_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "eDP.*connected" | awk '{print $1}')
 
@@ -647,16 +648,16 @@ fi
 echo ""
 
 # Start window manager, display utility, and xterm before running tests
-echo "=== Starting Window Manager ==="
+echo "[$(date '+%H:%M:%S')] === Starting Window Manager ==="
 XFWM4_PID=""
 WM_STARTED=0
 if command -v xfwm4 >/dev/null 2>&1; then
-    echo "Starting xfwm4 window manager..."
+    echo "[$(date '+%H:%M:%S')] Starting xfwm4 window manager..."
     DISPLAY="$TEST_DISPLAY" xfwm4 --replace >/tmp/xfwm4_${TEST_DISPLAY#:}.log 2>&1 &
     XFWM4_PID=$!
     sleep 3
     if kill -0 $XFWM4_PID 2>/dev/null; then
-        echo "✓ xfwm4 started (PID: $XFWM4_PID)"
+        echo "[$(date '+%H:%M:%S')] ✓ xfwm4 started (PID: $XFWM4_PID)"
         echo "  Windows should now be moveable and resizable"
         WM_STARTED=1
     else
@@ -684,10 +685,10 @@ if [ $WM_STARTED -eq 0 ]; then
 fi
 echo ""
 
-echo "=== Launching XFCE4 Display Settings ==="
+echo "[$(date '+%H:%M:%S')] === Launching XFCE4 Display Settings ==="
 DISPLAY_SETTINGS_PID=""
 if command -v xfce4-display-settings >/dev/null 2>&1; then
-    echo "Launching XFCE4 Display Settings (xfce4-display-settings)..."
+    echo "[$(date '+%H:%M:%S')] Launching XFCE4 Display Settings (xfce4-display-settings)..."
     DISPLAY="$TEST_DISPLAY" xfce4-display-settings >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
     DISPLAY_SETTINGS_PID=$!
     sleep 3
@@ -707,7 +708,7 @@ else
 fi
 echo ""
 
-echo "=== Launching xterm for test output ==="
+echo "[$(date '+%H:%M:%S')] === Launching xterm for test output ==="
 XRANDR_TERM_PID=""
 if command -v xterm >/dev/null 2>&1; then
     # Find the monitor at the top (smallest Y position, ideally +0+0)
