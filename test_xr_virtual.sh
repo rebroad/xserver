@@ -381,13 +381,6 @@ echo ""
 read -p "Press Enter to continue or Ctrl+C to cancel..."
 echo ""
 
-# Check if display is already in use
-if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
-    echo "ERROR: Display $TEST_DISPLAY is already in use!"
-    echo "Please stop the X server on $TEST_DISPLAY first, or use a different display."
-    exit 1
-fi
-
 # Double-check: Make sure we're not accidentally using display :0 (the main X server)
 if [ "$TEST_DISPLAY" = ":0" ]; then
     echo "ERROR: Cannot use display :0 - that's your main X server!"
@@ -403,19 +396,55 @@ if [ -n "$MAIN_XORG_VT" ] && [ "$MAIN_XORG_VT" = "$TEST_VT" ]; then
     exit 1
 fi
 
-# Only kill Xorg processes using this specific display (if any)
-# Find the PID of Xorg using this display
-XORG_PID_ON_DISPLAY=$(lsof -t "/tmp/.X11-unix/X${TEST_DISPLAY#:}" 2>/dev/null || true)
-if [ -n "$XORG_PID_ON_DISPLAY" ]; then
-    echo "Found Xorg process $XORG_PID_ON_DISPLAY using display $TEST_DISPLAY"
-    echo "Killing only that process..."
-    sudo kill "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
-    sleep 1
-    # Verify it's gone
-    if kill -0 "$XORG_PID_ON_DISPLAY" 2>/dev/null; then
-        echo "WARNING: Process still running, using kill -9..."
-        sudo kill -9 "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
+# Check if display is already in use and kill any Xorg using it (likely our previous test Xorg)
+if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
+    echo "Display $TEST_DISPLAY is already in use. Checking what's using it..."
+
+    # Find the PID of Xorg using this display socket
+    XORG_PID_ON_DISPLAY=$(lsof -t "/tmp/.X11-unix/X${TEST_DISPLAY#:}" 2>/dev/null || true)
+    if [ -n "$XORG_PID_ON_DISPLAY" ]; then
+        # Verify it's actually an Xorg process
+        if ps -p "$XORG_PID_ON_DISPLAY" -o comm= 2>/dev/null | grep -q "Xorg\|X"; then
+            echo "Found Xorg process $XORG_PID_ON_DISPLAY using display $TEST_DISPLAY"
+            echo "Killing it (this is likely a previous test Xorg server)..."
+            sudo kill "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
+            sleep 2
+            # Verify it's gone
+            if kill -0 "$XORG_PID_ON_DISPLAY" 2>/dev/null; then
+                echo "Process still running, force killing..."
+                sudo kill -9 "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
+                sleep 1
+            fi
+            # Wait a moment for the socket to be released
+            sleep 1
+            # Verify display is now free
+            if ! DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
+                echo "✓ Previous Xorg process killed, display $TEST_DISPLAY is now free"
+            else
+                echo "WARNING: Display $TEST_DISPLAY still appears to be in use after killing process"
+            fi
+        else
+            echo "ERROR: Process $XORG_PID_ON_DISPLAY using display $TEST_DISPLAY is not Xorg!"
+            echo "Please manually stop whatever is using display $TEST_DISPLAY"
+            exit 1
+        fi
+    else
+        echo "ERROR: Display $TEST_DISPLAY is in use but no process found using the socket"
+        echo "Please manually stop whatever is using display $TEST_DISPLAY"
+        exit 1
+    fi
+else
+    # Display is free, but check for any stale Xorg processes using the socket anyway
+    XORG_PID_ON_DISPLAY=$(lsof -t "/tmp/.X11-unix/X${TEST_DISPLAY#:}" 2>/dev/null || true)
+    if [ -n "$XORG_PID_ON_DISPLAY" ]; then
+        echo "Found stale Xorg process $XORG_PID_ON_DISPLAY on display socket (though xdpyinfo says display is free)"
+        echo "Cleaning it up..."
+        sudo kill "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
         sleep 1
+        if kill -0 "$XORG_PID_ON_DISPLAY" 2>/dev/null; then
+            sudo kill -9 "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
+            sleep 1
+        fi
     fi
 fi
 
@@ -782,39 +811,17 @@ else
 fi
 echo "Display Settings should be open - you can see the RandR outputs visually"
 echo ""
-echo "A dialog will appear on VT $TEST_VT - click 'Exit' when done testing..."
-
-# Show exit dialog
-if command -v zenity >/dev/null 2>&1; then
-    DISPLAY="$TEST_DISPLAY" zenity --info \
-        --title="XR Virtual Output Test" \
-        --text="XR Virtual Output Test is running on display $TEST_DISPLAY (VT $TEST_VT).\n\nClick 'OK' to exit and clean up." \
-        --width=400 --height=150 \
-        >/tmp/zenity_exit_${TEST_DISPLAY#:}.log 2>&1
-    echo "User clicked 'OK' - exiting..."
-elif command -v xmessage >/dev/null 2>&1; then
-    DISPLAY="$TEST_DISPLAY" xmessage -center -buttons "Exit:0" \
-        "XR Virtual Output Test is running.\n\nClick 'Exit' to clean up." \
-        >/tmp/xmessage_exit_${TEST_DISPLAY#:}.log 2>&1
-    EXIT_CODE=$?
-    if [ $EXIT_CODE -eq 0 ]; then
-        echo "User clicked 'Exit' - exiting..."
-    else
-        echo "Dialog closed - exiting..."
-    fi
+echo "Waiting for Display Settings to be closed (this will exit the test session)..."
+if [ -n "$DISPLAY_SETTINGS_PID" ]; then
+    wait $DISPLAY_SETTINGS_PID 2>/dev/null || true
+    echo "Display Settings closed - exiting..."
 else
-    echo "No graphical dialog available - press Enter to exit..."
+    echo "Display Settings was not running - press Enter to exit..."
     read -r
 fi
 
 echo ""
 echo "=== Cleanup ==="
-# Kill Display Settings if still running
-if [ -n "$DISPLAY_SETTINGS_PID" ] && kill -0 $DISPLAY_SETTINGS_PID 2>/dev/null; then
-    echo "Closing Display Settings..."
-    kill $DISPLAY_SETTINGS_PID 2>/dev/null || true
-    wait $DISPLAY_SETTINGS_PID 2>/dev/null || true
-fi
 
 # Kill xterm if still running
 if [ -n "$XRANDR_TERM_PID" ] && kill -0 $XRANDR_TERM_PID 2>/dev/null; then
