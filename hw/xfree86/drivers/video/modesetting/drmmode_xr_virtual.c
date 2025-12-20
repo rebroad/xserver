@@ -673,59 +673,109 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
     ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
     Atom create_atom, delete_atom;
 
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "drmmode_xr_virtual_output_post_screen_init called\n");
+
     if (!output) {
         xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
                    "XR-Manager output not found in post_screen_init\n");
         return FALSE;
     }
 
-    /* If RandR output already exists, we're done */
+    /* If RandR output already exists, ensure properties are registered */
     if (output->randr_output) {
-        return TRUE;
-    }
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                   "XR-Manager RandR output already exists, ensuring properties are registered\n");
+        /* Fall through to register properties */
+    } else {
 
-    /* Create RandR output for XR-Manager */
-    output->randr_output = RROutputCreate(pScreen, XR_MANAGER_OUTPUT_NAME,
-                                          strlen(XR_MANAGER_OUTPUT_NAME), output);
-    if (!output->randr_output) {
-        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
-                   "Failed to create RandR output for XR-Manager\n");
-        return FALSE;
-    }
+        /* Create RandR output for XR-Manager */
+        output->randr_output = RROutputCreate(pScreen, XR_MANAGER_OUTPUT_NAME,
+                                              strlen(XR_MANAGER_OUTPUT_NAME), output);
+        if (!output->randr_output) {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "Failed to create RandR output for XR-Manager\n");
+            return FALSE;
+        }
 
-    /* Always mark as disconnected (it's a control interface, not a real display) */
-    RROutputSetConnection(output->randr_output, RR_Disconnected);
+        /* Always mark as disconnected (it's a control interface, not a real display) */
+        RROutputSetConnection(output->randr_output, RR_Disconnected);
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                   "XR-Manager RandR output created\n");
+    }
 
     /* Create CREATE_XR_OUTPUT and DELETE_XR_OUTPUT properties */
     create_atom = XR_CREATE_OUTPUT_ATOM();
     delete_atom = XR_DELETE_OUTPUT_ATOM();
 
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "Creating properties: create_atom=%lu, delete_atom=%lu\n",
+               (unsigned long)create_atom, (unsigned long)delete_atom);
+
     if (create_atom != BAD_RESOURCE) {
-        /* Configure property metadata (RRConfigureOutputProperty expects INT32 for config) */
-        INT32 dummy = 0;
-        RRConfigureOutputProperty(output->randr_output, create_atom,
-                                 FALSE, FALSE, FALSE, /* pending, range, immutable */
-                                 1, &dummy);
-        /* Set initial empty value as STRING (this sets the actual type) */
-        char empty_str[] = "";
-        RRChangeOutputProperty(output->randr_output, create_atom,
-                              XA_STRING, 8, PropModeReplace, 1,
-                              (unsigned char *)empty_str, FALSE, FALSE);
+        /* Check if property already exists */
+        RRPropertyPtr prop = RRQueryOutputProperty(output->randr_output, create_atom);
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                   "CREATE_XR_OUTPUT property exists: %s\n",
+                   prop ? "yes" : "no");
+        if (!prop) {
+            /* Configure property metadata (RRConfigureOutputProperty expects INT32 for config) */
+            INT32 dummy = 0;
+            int err = RRConfigureOutputProperty(output->randr_output, create_atom,
+                                             FALSE, FALSE, FALSE, /* pending, range, immutable */
+                                             1, &dummy);
+            if (err != 0) {
+                xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                           "Failed to configure CREATE_XR_OUTPUT property: %d\n", err);
+            } else {
+                /* Set initial empty value as STRING (this sets the actual type) */
+                char empty_str[] = "";
+                err = RRChangeOutputProperty(output->randr_output, create_atom,
+                                          XA_STRING, 8, PropModeReplace, 1,
+                                          (unsigned char *)empty_str, FALSE, FALSE);
+                if (err != 0) {
+                    xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                               "Failed to set CREATE_XR_OUTPUT property value: %d\n", err);
+                } else {
+                    RRPostPendingProperties(output->randr_output);
+                    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                               "CREATE_XR_OUTPUT property registered\n");
+                }
+            }
+        }
     }
     if (delete_atom != BAD_RESOURCE) {
-        /* Configure property metadata (RRConfigureOutputProperty expects INT32 for config) */
-        INT32 dummy = 0;
-        RRConfigureOutputProperty(output->randr_output, delete_atom,
-                                 FALSE, FALSE, FALSE, /* pending, range, immutable */
-                                 1, &dummy);
-        /* Set initial empty value as STRING (this sets the actual type) */
-        char empty_str[] = "";
-        RRChangeOutputProperty(output->randr_output, delete_atom,
-                              XA_STRING, 8, PropModeReplace, 1,
-                              (unsigned char *)empty_str, FALSE, FALSE);
+        /* Check if property already exists */
+        RRPropertyPtr prop = RRQueryOutputProperty(output->randr_output, delete_atom);
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                   "DELETE_XR_OUTPUT property exists: %s\n",
+                   prop ? "yes" : "no");
+        if (!prop) {
+            /* Configure property metadata (RRConfigureOutputProperty expects INT32 for config) */
+            INT32 dummy = 0;
+            int err = RRConfigureOutputProperty(output->randr_output, delete_atom,
+                                             FALSE, FALSE, FALSE, /* pending, range, immutable */
+                                             1, &dummy);
+            if (err != 0) {
+                xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                           "Failed to configure DELETE_XR_OUTPUT property: %d\n", err);
+            } else {
+                /* Set initial empty value as STRING (this sets the actual type) */
+                char empty_str[] = "";
+                err = RRChangeOutputProperty(output->randr_output, delete_atom,
+                                          XA_STRING, 8, PropModeReplace, 1,
+                                          (unsigned char *)empty_str, FALSE, FALSE);
+                if (err != 0) {
+                    xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                               "Failed to set DELETE_XR_OUTPUT property value: %d\n", err);
+                } else {
+                    RRPostPendingProperties(output->randr_output);
+                    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                               "DELETE_XR_OUTPUT property registered\n");
+                }
+            }
+        }
     }
-
-    RRPostPendingProperties(output->randr_output);
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
                "XR-Manager RandR output created (use CREATE_XR_OUTPUT/DELETE_XR_OUTPUT properties)\n");
