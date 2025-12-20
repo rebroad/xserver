@@ -128,6 +128,16 @@ drmmode_xr_virtual_create_resources(xf86OutputPtr output)
 static xf86OutputFuncsRec drmmode_xr_virtual_output_funcs;
 
 /**
+ * Custom detect function for virtual XR outputs
+ * Always returns Connected since virtual outputs are always "available"
+ */
+static xf86OutputStatus
+drmmode_xr_virtual_output_detect(xf86OutputPtr output)
+{
+    return XF86OutputStatusConnected;
+}
+
+/**
  * Custom destroy function for virtual XR outputs
  * Only frees the driver_private structure, not DRM resources (which don't exist)
  */
@@ -146,10 +156,11 @@ drmmode_xr_virtual_output_destroy(xf86OutputPtr output)
 static void
 drmmode_xr_virtual_output_funcs_init(void)
 {
-    /* Copy from the regular output funcs, but override create_resources and destroy */
+    /* Copy from the regular output funcs, but override create_resources, destroy, and detect */
     drmmode_xr_virtual_output_funcs = drmmode_output_funcs;
     drmmode_xr_virtual_output_funcs.create_resources = drmmode_xr_virtual_create_resources;
     drmmode_xr_virtual_output_funcs.destroy = drmmode_xr_virtual_output_destroy;
+    drmmode_xr_virtual_output_funcs.detect = drmmode_xr_virtual_output_detect;
 }
 
 /**
@@ -275,6 +286,7 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     output->interlaceAllowed = TRUE;
     output->doubleScanAllowed = TRUE;
     output->non_desktop = FALSE;
+    output->status = XF86OutputStatusConnected; /* Mark as connected so xf86RandR12SetInfo12 preserves RR_Connected */
 
     /* Create RandR output */
     output->randr_output = RROutputCreate(pScreen, name, strlen(name), output);
@@ -677,7 +689,8 @@ drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
     output->subpixel_order = SubPixelUnknown;
     output->interlaceAllowed = TRUE;
     output->doubleScanAllowed = TRUE;
-    output->non_desktop = FALSE;
+    output->non_desktop = TRUE; /* XR-Manager is not a real display, hide from Display Settings */
+    output->status = XF86OutputStatusDisconnected; /* Keep disconnected so xf86RandR12SetInfo12 preserves RR_Disconnected */
 
     /* Don't create RandR output here - the screen doesn't exist yet */
     output->randr_output = NULL;
@@ -730,8 +743,10 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
 
         /* Always mark as disconnected (it's a control interface, not a real display) */
         RROutputSetConnection(output->randr_output, RR_Disconnected);
+        /* Mark as non-desktop so it doesn't show in Display Settings */
+        RROutputSetNonDesktop(output->randr_output, TRUE);
         xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                   "XR-Manager RandR output created\n");
+                   "XR-Manager RandR output created (non-desktop, disconnected)\n");
     }
 
     /* Create CREATE_XR_OUTPUT and DELETE_XR_OUTPUT properties */
