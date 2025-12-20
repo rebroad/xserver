@@ -794,37 +794,54 @@ if [ $WM_STARTED -eq 0 ]; then
 fi
 echo ""
 
-echo "[$(date '+%H:%M:%S')] === DBus Session Probe ==="
-echo "Checking DBus session bus availability (needed for Display Settings to apply changes)..."
-if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-    echo "  DBUS_SESSION_BUS_ADDRESS is set: $DBUS_SESSION_BUS_ADDRESS"
-    # Try to connect to the session bus
-    if command -v dbus-send >/dev/null 2>&1; then
-        if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId >/dev/null 2>&1; then
-            echo "  ✓ DBus session bus is accessible"
-        else
-            echo "  ✗ DBus session bus address set but not accessible"
-            echo "     Display Settings may not be able to apply changes"
-        fi
-    fi
-else
-    echo "  ✗ DBUS_SESSION_BUS_ADDRESS is not set"
-    # Try to set it from the user session bus
-    USER_BUS="/run/user/$(id -u)/bus"
-    if [ -S "$USER_BUS" ]; then
-        echo "  Found user session bus at $USER_BUS"
-        export DBUS_SESSION_BUS_ADDRESS="unix:path=$USER_BUS"
-        echo "  Set DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+echo "[$(date '+%H:%M:%S')] === DBus Session Setup ==="
+echo "Setting up DBus session bus for display $TEST_DISPLAY..."
+echo "  Note: We need a separate DBus session for $TEST_DISPLAY so xfsettingsd can control it"
+echo "        (xfsettingsd is a singleton per DBus session and the VT7 one is bound to :0)"
+
+# Check if dbus-launch is available
+if command -v dbus-launch >/dev/null 2>&1; then
+    # Start a new DBus session bus for this test display
+    # This allows xfsettingsd to run independently for :1
+    echo "  Starting new DBus session bus for $TEST_DISPLAY..."
+    DBUS_SESSION_OUTPUT=$(dbus-launch --sh-syntax 2>&1)
+    if [ $? -eq 0 ]; then
+        # Evaluate the output to set DBUS_SESSION_BUS_ADDRESS and DBUS_SESSION_BUS_PID
+        eval "$DBUS_SESSION_OUTPUT"
+        export DBUS_SESSION_BUS_ADDRESS
+        export DBUS_SESSION_BUS_PID
+        echo "  ✓ New DBus session bus started (PID: $DBUS_SESSION_BUS_PID)"
+        echo "  DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+
+        # Verify it's accessible
         if command -v dbus-send >/dev/null 2>&1; then
             if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId >/dev/null 2>&1; then
-                echo "  ✓ DBus session bus is now accessible"
+                echo "  ✓ DBus session bus is accessible"
             else
-                echo "  ✗ DBus session bus still not accessible after setting"
+                echo "  ✗ DBus session bus not accessible"
             fi
         fi
     else
-        echo "  User session bus not found at $USER_BUS"
-        echo "  Display Settings may not be able to apply changes without DBus"
+        echo "  ✗ Failed to start DBus session bus, falling back to existing session bus"
+        # Fall back to existing session bus
+        if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+            USER_BUS="/run/user/$(id -u)/bus"
+            if [ -S "$USER_BUS" ]; then
+                export DBUS_SESSION_BUS_ADDRESS="unix:path=$USER_BUS"
+                echo "  Using existing session bus: $DBUS_SESSION_BUS_ADDRESS"
+            fi
+        fi
+    fi
+else
+    echo "  ⚠ dbus-launch not available, using existing session bus"
+    echo "  Note: This means xfsettingsd from VT7 may not be able to control display :1"
+    # Use existing session bus if available
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        USER_BUS="/run/user/$(id -u)/bus"
+        if [ -S "$USER_BUS" ]; then
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$USER_BUS"
+            echo "  Using existing session bus: $DBUS_SESSION_BUS_ADDRESS"
+        fi
     fi
 fi
 
@@ -860,33 +877,73 @@ else
     echo "  ⚠ Cannot check for XFCE services (dbus-send not available or DBUS_SESSION_BUS_ADDRESS not set)"
 fi
 
-# Start xfsettingsd if it's not running (needed for Display Settings to apply changes)
-if [ -z "$SETTINGS_DAEMON_RUNNING" ] && command -v xfsettingsd >/dev/null 2>&1; then
-    echo ""
-    echo "Starting xfsettingsd (XFCE Settings Daemon) - required for Display Settings to apply changes..."
-    DISPLAY="$TEST_DISPLAY" env ${DBUS_SESSION_BUS_ADDRESS:+DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"} xfsettingsd >/tmp/xfsettingsd_${TEST_DISPLAY#:}.log 2>&1 &
-    XFSETTINGSD_PID=$!
-    sleep 2
-    if kill -0 $XFSETTINGSD_PID 2>/dev/null; then
-        echo "  ✓ xfsettingsd started (PID: $XFSETTINGSD_PID)"
-        # Wait a moment for it to register on DBus
+# Always start xfsettingsd for the test display (even if one exists on session bus from VT7)
+# The one on VT7 is bound to display :0, but Display Settings on :1 needs its own instance
+if command -v xfsettingsd >/dev/null 2>&1; then
+    # Check if there's already an xfsettingsd running for this specific display
+    EXISTING_XFSETTINGSD=$(DISPLAY="$TEST_DISPLAY" ps aux | grep "[x]fsettingsd.*--display.*${TEST_DISPLAY}" || echo "")
+
+    if [ -z "$EXISTING_XFSETTINGSD" ]; then
+        echo ""
+        echo "Starting xfsettingsd (XFCE Settings Daemon) for display $TEST_DISPLAY..."
+        echo "  Note: Even if xfsettingsd exists on the session bus (from VT7), we need one for $TEST_DISPLAY"
+        echo "  The VT7 xfsettingsd is bound to display :0 and cannot control display :1"
+
+        # xfsettingsd uses DISPLAY environment variable, not --display argument
+        # Wait a moment to ensure Xorg is fully ready before starting xfsettingsd
         sleep 1
-        # Verify it's now on DBus
-        if command -v dbus-send >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-            SETTINGS_DAEMON_RUNNING=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.xfce.SettingsDaemon 2>/dev/null | grep -o "boolean true" || echo "")
-            if [ -n "$SETTINGS_DAEMON_RUNNING" ]; then
-                echo "  ✓ xfsettingsd is now registered on DBus"
-            else
-                echo "  ⚠ xfsettingsd started but not yet visible on DBus (may need more time)"
+
+        # Verify Xorg is accessible before starting xfsettingsd
+        if ! DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
+            echo "  ⚠ Xorg on $TEST_DISPLAY not yet accessible, waiting..."
+            sleep 2
+        fi
+
+        # Start xfsettingsd with DISPLAY set to the test display
+        # Note: xfsettingsd may only allow one instance per DBus session, so this might fail
+        # if one is already running from VT7. In that case, Display Settings might need
+        # to work with the existing instance, but it won't be able to control :1
+        DISPLAY="$TEST_DISPLAY" env ${DBUS_SESSION_BUS_ADDRESS:+DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"} xfsettingsd >/tmp/xfsettingsd_${TEST_DISPLAY#:}.log 2>&1 &
+        XFSETTINGSD_PID=$!
+        sleep 2
+
+        if kill -0 $XFSETTINGSD_PID 2>/dev/null; then
+            echo "  ✓ xfsettingsd started for $TEST_DISPLAY (PID: $XFSETTINGSD_PID)"
+            # Wait a moment for it to register on DBus
+            sleep 1
+            # Verify it's now on DBus
+            if command -v dbus-send >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+                SETTINGS_DAEMON_RUNNING=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.xfce.SettingsDaemon 2>/dev/null | grep -o "boolean true" || echo "")
+                if [ -n "$SETTINGS_DAEMON_RUNNING" ]; then
+                    echo "  ✓ xfsettingsd is registered on DBus"
+                else
+                    echo "  ⚠ xfsettingsd started but not yet visible on DBus (checking log...)"
+                    if [ -f /tmp/xfsettingsd_${TEST_DISPLAY#:}.log ]; then
+                        echo "  Last 5 lines of xfsettingsd log:"
+                        tail -5 /tmp/xfsettingsd_${TEST_DISPLAY#:}.log | sed 's/^/    /'
+                    fi
+                fi
             fi
+        else
+            echo "  ✗ xfsettingsd failed to start (check /tmp/xfsettingsd_${TEST_DISPLAY#:}.log)"
+            if [ -f /tmp/xfsettingsd_${TEST_DISPLAY#:}.log ]; then
+                echo "  Last 10 lines of log:"
+                tail -10 /tmp/xfsettingsd_${TEST_DISPLAY#:}.log | sed 's/^/    /'
+                echo ""
+                echo "  NOTE: xfsettingsd may only allow one instance per DBus session."
+                echo "        If one is already running from VT7, it cannot control display :1."
+                echo "        Display Settings on :1 may not be able to apply changes."
+                echo "        This is a limitation of sharing the same DBus session between displays."
+            fi
+            XFSETTINGSD_PID=""
         fi
     else
-        echo "  ✗ xfsettingsd failed to start (check /tmp/xfsettingsd_${TEST_DISPLAY#:}.log)"
-        XFSETTINGSD_PID=""
+        echo ""
+        echo "  ℹ xfsettingsd already running for $TEST_DISPLAY (found existing process)"
     fi
-elif [ -z "$SETTINGS_DAEMON_RUNNING" ]; then
+else
     echo ""
-    echo "  ⚠ WARNING: xfsettingsd is not running and not available - Display Settings may not be able to apply changes"
+    echo "  ⚠ WARNING: xfsettingsd not available - Display Settings may not be able to apply changes"
 fi
 echo ""
 
@@ -1166,6 +1223,16 @@ if [ -n "$XFSETTINGSD_PID" ] && kill -0 $XFSETTINGSD_PID 2>/dev/null; then
     sleep 0.5
     if kill -0 $XFSETTINGSD_PID 2>/dev/null; then
         kill -9 $XFSETTINGSD_PID 2>/dev/null || true
+    fi
+fi
+
+# Kill DBus session bus if we started one
+if [ -n "${DBUS_SESSION_BUS_PID:-}" ] && kill -0 $DBUS_SESSION_BUS_PID 2>/dev/null; then
+    echo "Stopping DBus session bus (PID: $DBUS_SESSION_BUS_PID)..."
+    kill $DBUS_SESSION_BUS_PID 2>/dev/null || true
+    sleep 0.5
+    if kill -0 $DBUS_SESSION_BUS_PID 2>/dev/null; then
+        kill -9 $DBUS_SESSION_BUS_PID 2>/dev/null || true
     fi
 fi
 
