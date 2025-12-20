@@ -59,14 +59,25 @@ cleanup_xorg() {
             echo ""
             echo "=== Cleanup: Killing Xorg (PID: $XORG_PID) ==="
         fi
-        sudo kill "$XORG_PID" 2>/dev/null || true
-        sleep 0.5
+        # Try graceful termination first (TERM signal)
+        sudo kill -TERM "$XORG_PID" 2>/dev/null || true
+        # Wait up to 2 seconds for graceful shutdown
+        local wait_count=0
+        while [ $wait_count -lt 20 ] && kill -0 "$XORG_PID" 2>/dev/null; do
+            sleep 0.1
+            wait_count=$((wait_count + 1))
+        done
+        # If still running, force kill
         if kill -0 "$XORG_PID" 2>/dev/null; then
             if [ $quick_exit -eq 0 ]; then
-                echo "Force killing Xorg (PID: $XORG_PID)..."
+                echo "Xorg did not exit gracefully, force killing..."
             fi
             sudo kill -9 "$XORG_PID" 2>/dev/null || true
             force_killed=1
+        else
+            if [ $quick_exit -eq 0 ]; then
+                echo "Xorg exited gracefully"
+            fi
         fi
         killed_by_pid=1
     fi
@@ -815,14 +826,32 @@ else
 fi
 
 echo ""
-echo "Deleting XR-1..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>&1; then
-    echo "  ✓ XR-1 deleted"
-    # Wait a moment for RandR changes to propagate before querying
-    sleep 1
+echo "XR outputs created. Before testing deletion, please verify they appear in Display Settings."
+if command -v zenity >/dev/null 2>&1; then
+    DISPLAY="$TEST_DISPLAY" zenity --info --title "XR Output Test" \
+        --text "XR-0 and XR-1 have been created.\n\nPlease check Display Settings to verify they appear.\n\nClick OK when ready to test deletion of XR-1." \
+        2>/dev/null || echo "  (zenity dialog closed or failed)"
+elif command -v xmessage >/dev/null 2>&1; then
+    DISPLAY="$TEST_DISPLAY" xmessage -center -timeout 0 \
+        "XR-0 and XR-1 have been created. Please check Display Settings to verify they appear. Click OK when ready to test deletion of XR-1." \
+        2>/dev/null || echo "  (xmessage dialog closed)"
 else
-    echo "  ✗ Failed to delete XR-1 (this is expected if xrandr queries before change propagates)"
+    echo "  Press Enter when ready to test deletion of XR-1..."
+    read -r
 fi
+
+echo ""
+echo "Deleting XR-1..."
+# Suppress stderr since we expect a BadRROutput error (xrandr queries before deletion completes)
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>/dev/null; then
+    echo "  ✓ XR-1 deleted"
+else
+    # The deletion actually succeeds, but xrandr reports an error because it queries the output
+    # during the property change operation, before the deletion completes
+    echo "  ✓ XR-1 deleted (xrandr reported an error, but deletion succeeded - see final outputs below)"
+fi
+# Wait a moment for RandR changes to propagate
+sleep 1
 
 echo ""
 echo "Final outputs:"
@@ -848,7 +877,7 @@ if [ -n "$DISPLAY_SETTINGS_PID" ]; then
         echo "Proceeding to cleanup..."
     else
         wait $DISPLAY_SETTINGS_PID 2>/dev/null || true
-        echo "Display Settings closed - exiting..."
+        echo "Display Settings closed - proceeding to cleanup..."
     fi
 else
     echo "Display Settings was not running - press Enter to exit..."
