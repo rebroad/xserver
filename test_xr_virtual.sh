@@ -698,25 +698,51 @@ echo ""
 echo "=== Launching xterm for test output ==="
 XRANDR_TERM_PID=""
 if command -v xterm >/dev/null 2>&1; then
-    EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
-    if [ -n "$EXTERNAL_MONITOR" ]; then
-        MONITOR_POS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "\+[0-9]+\+[0-9]+" | head -1)
+    # Find the monitor at the top (smallest Y position, ideally +0+0)
+    # This should be the external monitor we arranged to be above the laptop
+    TARGET_MONITOR=""
+    TOP_Y=999999
+    TERM_X=50
+    TERM_Y=50
+    TERM_HEIGHT=50
+
+    # Parse --listmonitors to find the monitor with the smallest Y position
+    while IFS= read -r line; do
+        # Format: " 0: +*eDP-1 1920/293x1080/165+0+2160  eDP-1"
+        MONITOR_POS=$(echo "$line" | grep -oE "\+[0-9]+\+[0-9]+" | head -1)
         if [ -n "$MONITOR_POS" ]; then
+            Y_POS=$(echo "$MONITOR_POS" | cut -d+ -f3)
+            if [ -n "$Y_POS" ] && [ "$Y_POS" -lt "$TOP_Y" ]; then
+                TOP_Y=$Y_POS
+                # Extract monitor name (e.g., "DP-1" or "eDP-1")
+                TARGET_MONITOR=$(echo "$line" | awk '{print $NF}')
+                MONITOR_INFO="$line"
+            fi
+        fi
+    done < <(DISPLAY="$TEST_DISPLAY" xrandr --listmonitors 2>/dev/null | tail -n +2)
+
+    if [ -n "$TARGET_MONITOR" ] && [ -n "$MONITOR_INFO" ]; then
+        # Extract dimensions (e.g., 1920x1080) and position (e.g., +0+0)
+        MONITOR_DIM=$(echo "$MONITOR_INFO" | grep -oE "[0-9]+/[0-9]+x[0-9]+/[0-9]+" | head -1)
+        MONITOR_POS=$(echo "$MONITOR_INFO" | grep -oE "\+[0-9]+\+[0-9]+" | head -1)
+        if [ -n "$MONITOR_DIM" ] && [ -n "$MONITOR_POS" ]; then
+            # Extract height (second number after 'x', e.g., 1080 from "1920/293x1080/165")
+            MONITOR_HEIGHT=$(echo "$MONITOR_DIM" | cut -dx -f2 | cut -d/ -f1)
+            # Calculate 80% of height in character lines (assuming ~15 pixels per line)
+            TERM_HEIGHT=$(( (MONITOR_HEIGHT * 80 / 100) / 15 ))
+            # Ensure minimum and maximum reasonable values
+            if [ $TERM_HEIGHT -lt 20 ]; then TERM_HEIGHT=20; fi
+            if [ $TERM_HEIGHT -gt 80 ]; then TERM_HEIGHT=80; fi
+
             X_POS=$(echo "$MONITOR_POS" | cut -d+ -f2)
             Y_POS=$(echo "$MONITOR_POS" | cut -d+ -f3)
             TERM_X=$((X_POS + 50))
             TERM_Y=$((Y_POS + 50))
-        else
-            TERM_X=50
-            TERM_Y=50
         fi
-    else
-        TERM_X=50
-        TERM_Y=50
     fi
 
-    echo "Launching xterm to show all test output on VT $TEST_VT..."
-    DISPLAY="$TEST_DISPLAY" xterm -geometry 100x30+${TERM_X}+${TERM_Y} -title "XRandR Test Output" -e bash -c "tail -f '$XRANDR_LOG'" >/tmp/xrandr_term_${TEST_DISPLAY#:}.log 2>&1 &
+    echo "Launching xterm to show all test output on VT $TEST_VT (height: ${TERM_HEIGHT} lines, ~80% of monitor height)..."
+    DISPLAY="$TEST_DISPLAY" xterm -geometry 100x${TERM_HEIGHT}+${TERM_X}+${TERM_Y} -title "XRandR Test Output" -e bash -c "tail -f '$XRANDR_LOG'" >/tmp/xrandr_term_${TEST_DISPLAY#:}.log 2>&1 &
     XRANDR_TERM_PID=$!
     sleep 1
     if kill -0 $XRANDR_TERM_PID 2>/dev/null; then
@@ -792,9 +818,10 @@ echo ""
 echo "Deleting XR-1..."
 if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>&1; then
     echo "  ✓ XR-1 deleted"
-    sleep 2
+    # Wait a moment for RandR changes to propagate before querying
+    sleep 1
 else
-    echo "  ✗ Failed to delete XR-1"
+    echo "  ✗ Failed to delete XR-1 (this is expected if xrandr queries before change propagates)"
 fi
 
 echo ""
