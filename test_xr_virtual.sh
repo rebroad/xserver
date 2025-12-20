@@ -422,7 +422,13 @@ EndSection
 Section "Device"
     Identifier "TestDevice"
     Driver "modesetting"
-    Option "AccelMethod" "none"
+    # Try Glamor first (enables TearFree and better performance, reduces flickering)
+    # If Glamor is not available, Xorg will fall back to "none" automatically
+    Option "AccelMethod" "glamor"
+    # Enable TearFree to prevent screen tearing/flickering (requires Glamor)
+    Option "TearFree" "true"
+    # DoubleShadow helps with VNC/remote displays but may not fix local flickering
+    # Option "DoubleShadow" "true"
 EndSection
 
 Section "ServerFlags"
@@ -692,48 +698,77 @@ else
 fi
 
 echo ""
-echo "=== Test 6: Start XFCE4 session ==="
-XFCE_PID=""
-if command -v xfce4-session >/dev/null 2>&1; then
-    echo "Starting XFCE4 session..."
-    export DISPLAY="$TEST_DISPLAY"
-    export XDG_SESSION_TYPE=x11
-    export XDG_CURRENT_DESKTOP=XFCE
-    export DESKTOP_SESSION=xfce
-    # Start XFCE4 session in background
-    DISPLAY="$TEST_DISPLAY" xfce4-session >/tmp/xfce4_${TEST_DISPLAY#:}.log 2>&1 &
-    XFCE_PID=$!
-    sleep 5  # Give XFCE4 time to start
-    if kill -0 $XFCE_PID 2>/dev/null; then
-        echo "✓ XFCE4 session started (PID: $XFCE_PID)"
-    else
-        echo "⚠ XFCE4 session may have exited (check /tmp/xfce4_${TEST_DISPLAY#:}.log)"
-        XFCE_PID=""
-    fi
-else
-    echo "⚠ xfce4-session not found - falling back to window manager"
-    # Fallback to window manager
-    WM_CMD=""
-    if command -v openbox >/dev/null 2>&1; then
-        WM_CMD="openbox"
-    elif command -v twm >/dev/null 2>&1; then
-        WM_CMD="twm"
-    elif command -v metacity >/dev/null 2>&1; then
-        WM_CMD="metacity --replace"
-    elif command -v xfwm4 >/dev/null 2>&1; then
-        WM_CMD="xfwm4 --replace"
+echo "=== Test 6: Arrange displays (external monitor ABOVE laptop) ==="
+# Position external monitor above laptop display
+EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
+LAPTOP_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "eDP.*connected" | awk '{print $1}')
+
+if [ -n "$EXTERNAL_MONITOR" ] && [ -n "$LAPTOP_MONITOR" ]; then
+    echo "Arranging displays: $EXTERNAL_MONITOR above $LAPTOP_MONITOR"
+    # Get external monitor height to calculate position
+    EXTERNAL_HEIGHT=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "[0-9]+x[0-9]+" | head -1 | cut -dx -f2)
+    if [ -z "$EXTERNAL_HEIGHT" ]; then
+        EXTERNAL_HEIGHT=2160  # Default to 4K height if we can't detect
     fi
 
-    if [ -n "$WM_CMD" ]; then
-        echo "Starting window manager: $WM_CMD"
-        DISPLAY="$TEST_DISPLAY" $WM_CMD >/tmp/wm_${TEST_DISPLAY#:}.log 2>&1 &
-        XFCE_PID=$!
-        sleep 2
+    # Position external monitor above (y=0) and laptop below (y=external_height)
+    if DISPLAY="$TEST_DISPLAY" xrandr --output "$EXTERNAL_MONITOR" --above "$LAPTOP_MONITOR" 2>/dev/null; then
+        echo "✓ Displays arranged: $EXTERNAL_MONITOR above $LAPTOP_MONITOR"
+    else
+        # Fallback: set explicit positions
+        echo "  Using explicit positioning..."
+        DISPLAY="$TEST_DISPLAY" xrandr --output "$EXTERNAL_MONITOR" --pos 0x0 2>/dev/null
+        DISPLAY="$TEST_DISPLAY" xrandr --output "$LAPTOP_MONITOR" --pos 0x${EXTERNAL_HEIGHT} 2>/dev/null
+        echo "✓ Displays positioned explicitly"
     fi
+else
+    echo "⚠ Could not detect both monitors for arrangement"
 fi
 
 echo ""
-echo "=== Test 7: Test mouse pointer (with window manager) ==="
+echo "=== Test 7: Start window manager (xfwm4) ==="
+XFWM4_PID=""
+
+# xfce4-session conflicts with the main X server's session, so start xfwm4 directly
+# Try xfwm4 first, fallback to openbox if it fails
+WM_STARTED=0
+if command -v xfwm4 >/dev/null 2>&1; then
+    echo "Starting xfwm4 window manager..."
+    DISPLAY="$TEST_DISPLAY" xfwm4 --replace >/tmp/xfwm4_${TEST_DISPLAY#:}.log 2>&1 &
+    XFWM4_PID=$!
+    sleep 3  # Give xfwm4 time to start
+
+    if kill -0 $XFWM4_PID 2>/dev/null; then
+        echo "✓ xfwm4 started (PID: $XFWM4_PID)"
+        echo "  Windows should now be moveable and resizable"
+        WM_STARTED=1
+    else
+        echo "⚠ xfwm4 exited immediately (check /tmp/xfwm4_${TEST_DISPLAY#:}.log)"
+        XFWM4_PID=""
+    fi
+fi
+
+# Fallback to openbox if xfwm4 failed or not found
+if [ $WM_STARTED -eq 0 ] && command -v openbox >/dev/null 2>&1; then
+    echo "Starting openbox as fallback..."
+    DISPLAY="$TEST_DISPLAY" openbox >/tmp/wm_${TEST_DISPLAY#:}.log 2>&1 &
+    XFWM4_PID=$!
+    sleep 2
+    if kill -0 $XFWM4_PID 2>/dev/null; then
+        echo "✓ openbox started (PID: $XFWM4_PID)"
+        WM_STARTED=1
+    else
+        echo "⚠ openbox also failed to start"
+        XFWM4_PID=""
+    fi
+fi
+
+if [ $WM_STARTED -eq 0 ]; then
+    echo "⚠ No window manager started - windows won't be moveable"
+fi
+
+echo ""
+echo "=== Test 8: Test mouse pointer (with window manager) ==="
 if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
     echo "✓ Mouse pointer cursor set"
 
@@ -776,21 +811,22 @@ if DISPLAY="$TEST_DISPLAY" xsetroot -cursor_name left_ptr >/dev/null 2>&1; then
         fi
     fi
 
-    if [ -n "$XFCE_PID" ]; then
-        echo "  ✓ XFCE4 session is running - cursor should be visible"
+    if [ -n "$XFWM4_PID" ]; then
+        echo "  ✓ Window manager (xfwm4/openbox) is running - cursor should be visible"
+        echo "  ✓ Windows should be moveable and resizable"
         echo ""
         echo "  Note: Physical mouse/touchpad should work when you switch to VT $TEST_VT."
         echo "        Input devices are shared between VTs - the active VT gets input."
         echo "        If mouse doesn't work, check Xorg log for input device errors."
     else
-        echo "  ⚠ No window manager/session - cursor may not be visible"
+        echo "  ⚠ No window manager - cursor may not be visible and windows won't be moveable"
     fi
 else
     echo "✗ Failed to set mouse pointer"
 fi
 
 echo ""
-echo "=== Test 8: Verify X11 graphics capabilities ==="
+echo "=== Test 9: Verify X11 graphics capabilities ==="
 if DISPLAY="$TEST_DISPLAY" xdpyinfo >/dev/null 2>&1; then
     echo "✓ X server is responding to X11 protocol"
 else
@@ -798,7 +834,7 @@ else
 fi
 
 echo ""
-echo "=== Test 9: Launch XFCE4 Display Settings ==="
+echo "=== Test 10: Launch XFCE4 Display Settings ==="
 DISPLAY_SETTINGS_PID=""
 if command -v xfce4-display-settings >/dev/null 2>&1; then
     echo "Launching XFCE4 Display Settings (xfce4-display-settings)..."
@@ -838,7 +874,7 @@ else
 fi
 
 echo ""
-echo "=== Test 10: Automated XR Output Tests ==="
+echo "=== Test 11: Automated XR Output Tests ==="
 echo "Waiting 5 seconds for Display Settings to fully open..."
 sleep 5
 
@@ -906,7 +942,11 @@ DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | head -10
 echo ""
 echo "=== Interactive Testing ==="
 echo "Xorg is running on display $TEST_DISPLAY (VT $TEST_VT)"
-echo "XFCE4 session is running (PID: ${XFCE_PID:-N/A})"
+if [ -n "$XFWM4_PID" ]; then
+    echo "Window manager (xfwm4/openbox) is running (PID: $XFWM4_PID)"
+else
+    echo "Window manager: not running"
+fi
 echo "Display Settings should be open - you can see the RandR outputs visually"
 echo ""
 echo "You can now:"
@@ -1033,25 +1073,13 @@ if [ -n "$XLOGO_PIDS" ]; then
     done
 fi
 
-# Kill xfwm4 if still running
+# Kill window manager if still running
 if [ -n "$XFWM4_PID" ] && kill -0 $XFWM4_PID 2>/dev/null; then
-    echo "Stopping xfwm4..."
+    echo "Stopping window manager..."
     kill $XFWM4_PID 2>/dev/null || true
     sleep 1
     if kill -0 $XFWM4_PID 2>/dev/null; then
         kill -9 $XFWM4_PID 2>/dev/null || true
-    fi
-fi
-
-# Kill XFCE4 session if still running
-if [ -n "$XFCE_PID" ] && kill -0 $XFCE_PID 2>/dev/null; then
-    echo "Stopping XFCE4 session..."
-    kill $XFCE_PID 2>/dev/null || true
-    # Give it time to clean up
-    sleep 2
-    if kill -0 $XFCE_PID 2>/dev/null; then
-        echo "Force killing XFCE4 session..."
-        kill -9 $XFCE_PID 2>/dev/null || true
     fi
 fi
 
