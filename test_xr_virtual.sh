@@ -564,9 +564,235 @@ for i in {1..15}; do
         XORG_STARTED=1
         break
     fi
-elif command -v xmessage >/dev/null 2>&1; then
-    # Fallback to xmessage
+    if [ $i -eq 15 ]; then
+        echo "WARNING: Xorg started but not responding after 15 seconds"
+        echo "Killing Xorg to prevent system lockup..."
+        cleanup_xorg "timeout - not responding after 15 seconds"
+        echo "Check logs:"
+        tail -50 "$TEST_LOG" 2>/dev/null || echo "(log file not found)"
+        exit 1
+    fi
+done
+
+if [ $XORG_STARTED -eq 0 ]; then
+    echo "ERROR: Xorg failed to start properly"
+    cleanup_xorg "failed to start properly"
+    exit 1
+fi
+
+echo "Xorg started (PID: $XORG_PID)"
+echo ""
+
+# Arrange displays first (before window manager and display settings)
+echo "=== Arranging displays (external monitor ABOVE laptop) ==="
+EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
+LAPTOP_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "eDP.*connected" | awk '{print $1}')
+
+if [ -n "$EXTERNAL_MONITOR" ] && [ -n "$LAPTOP_MONITOR" ]; then
+    echo "Arranging displays: $EXTERNAL_MONITOR above $LAPTOP_MONITOR"
+    if DISPLAY="$TEST_DISPLAY" xrandr --output "$EXTERNAL_MONITOR" --above "$LAPTOP_MONITOR" 2>/dev/null; then
+        echo "✓ Displays arranged: $EXTERNAL_MONITOR above $LAPTOP_MONITOR"
+    else
+        echo "  Using explicit positioning..."
+        EXTERNAL_HEIGHT=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "[0-9]+x[0-9]+" | head -1 | cut -dx -f2)
+        if [ -z "$EXTERNAL_HEIGHT" ]; then EXTERNAL_HEIGHT=2160; fi
+        DISPLAY="$TEST_DISPLAY" xrandr --output "$EXTERNAL_MONITOR" --pos 0x0 2>/dev/null
+        DISPLAY="$TEST_DISPLAY" xrandr --output "$LAPTOP_MONITOR" --pos 0x${EXTERNAL_HEIGHT} 2>/dev/null
+        echo "✓ Displays positioned explicitly"
+    fi
+else
+    echo "⚠ Could not detect both monitors for arrangement"
+fi
+echo ""
+
+# Start window manager, display utility, and xterm before running tests
+echo "=== Starting Window Manager ==="
+XFWM4_PID=""
+WM_STARTED=0
+if command -v xfwm4 >/dev/null 2>&1; then
+    echo "Starting xfwm4 window manager..."
+    DISPLAY="$TEST_DISPLAY" xfwm4 --replace >/tmp/xfwm4_${TEST_DISPLAY#:}.log 2>&1 &
+    XFWM4_PID=$!
+    sleep 3
+    if kill -0 $XFWM4_PID 2>/dev/null; then
+        echo "✓ xfwm4 started (PID: $XFWM4_PID)"
+        echo "  Windows should now be moveable and resizable"
+        WM_STARTED=1
+    else
+        echo "⚠ xfwm4 exited immediately (check /tmp/xfwm4_${TEST_DISPLAY#:}.log)"
+        XFWM4_PID=""
+    fi
+fi
+
+if [ $WM_STARTED -eq 0 ] && command -v openbox >/dev/null 2>&1; then
+    echo "Starting openbox as fallback..."
+    DISPLAY="$TEST_DISPLAY" openbox >/tmp/wm_${TEST_DISPLAY#:}.log 2>&1 &
+    XFWM4_PID=$!
+    sleep 2
+    if kill -0 $XFWM4_PID 2>/dev/null; then
+        echo "✓ openbox started (PID: $XFWM4_PID)"
+        WM_STARTED=1
+    else
+        echo "⚠ openbox also failed to start"
+        XFWM4_PID=""
+    fi
+fi
+
+if [ $WM_STARTED -eq 0 ]; then
+    echo "⚠ No window manager started - windows won't be moveable"
+fi
+echo ""
+
+echo "=== Launching XFCE4 Display Settings ==="
+DISPLAY_SETTINGS_PID=""
+if command -v xfce4-display-settings >/dev/null 2>&1; then
+    echo "Launching XFCE4 Display Settings (xfce4-display-settings)..."
+    DISPLAY="$TEST_DISPLAY" xfce4-display-settings >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
+    DISPLAY_SETTINGS_PID=$!
+    sleep 3
+    if kill -0 $DISPLAY_SETTINGS_PID 2>/dev/null; then
+        echo "✓ Display Settings launched (PID: $DISPLAY_SETTINGS_PID)"
+        echo "  You should see the Display Settings window showing RandR outputs"
+    else
+        echo "⚠ Display Settings exited immediately (check /tmp/display_settings_${TEST_DISPLAY#:}.log)"
+        if [ -f /tmp/display_settings_${TEST_DISPLAY#:}.log ]; then
+            echo "  Last 10 lines of log:"
+            tail -10 /tmp/display_settings_${TEST_DISPLAY#:}.log | sed 's/^/    /'
+        fi
+        DISPLAY_SETTINGS_PID=""
+    fi
+else
+    echo "⚠ xfce4-display-settings not found"
+fi
+echo ""
+
+echo "=== Launching xterm for test output ==="
+XRANDR_TERM_PID=""
+if command -v xterm >/dev/null 2>&1; then
     EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
+    if [ -n "$EXTERNAL_MONITOR" ]; then
+        MONITOR_POS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "\+[0-9]+\+[0-9]+" | head -1)
+        if [ -n "$MONITOR_POS" ]; then
+            X_POS=$(echo "$MONITOR_POS" | cut -d+ -f2)
+            Y_POS=$(echo "$MONITOR_POS" | cut -d+ -f3)
+            TERM_X=$((X_POS + 50))
+            TERM_Y=$((Y_POS + 50))
+        else
+            TERM_X=50
+            TERM_Y=50
+        fi
+    else
+        TERM_X=50
+        TERM_Y=50
+    fi
+
+    echo "Launching xterm to show all test output on VT $TEST_VT..."
+    DISPLAY="$TEST_DISPLAY" xterm -geometry 100x30+${TERM_X}+${TERM_Y} -title "XRandR Test Output" -e bash -c "tail -f '$XRANDR_LOG'" >/tmp/xrandr_term_${TEST_DISPLAY#:}.log 2>&1 &
+    XRANDR_TERM_PID=$!
+    sleep 1
+    if kill -0 $XRANDR_TERM_PID 2>/dev/null; then
+        echo "✓ xterm launched (PID: $XRANDR_TERM_PID) - you should see it on VT $TEST_VT"
+    else
+        echo "⚠ xterm failed to launch"
+        XRANDR_TERM_PID=""
+    fi
+else
+    echo "⚠ xterm not found"
+fi
+echo ""
+
+# Test 1: Check if XR-Manager appears in xrandr
+echo "=== Test 1: Check if XR-Manager appears in xrandr ==="
+echo "All outputs:"
+DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" || DISPLAY="$TEST_DISPLAY" xrandr 2>&1
+echo ""
+
+# Test 2: List all monitors
+echo "=== Test 2: List all monitors ==="
+DISPLAY="$TEST_DISPLAY" xrandr --listmonitors
+echo ""
+
+# Test 3: Automated XR Output Tests
+echo "=== Test 3: Automated XR Output Tests ==="
+echo "Waiting a moment for Display Settings to fully open..."
+sleep 2
+
+echo ""
+echo "Creating virtual XR outputs..."
+echo "  Creating XR-0 (1920x1080@60Hz)..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-0:1920:1080:60" 2>&1; then
+    echo "  ✓ XR-0 created"
+    sleep 2
+else
+    echo "  ✗ Failed to create XR-0"
+fi
+
+echo "  Creating XR-1 (2560x1440@60Hz)..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-1:2560:1440:60" 2>&1; then
+    echo "  ✓ XR-1 created"
+    sleep 2
+else
+    echo "  ✗ Failed to create XR-1"
+fi
+
+echo ""
+echo "Current outputs:"
+DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
+
+echo ""
+echo "Resizing XR-0 to 3840x2160..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_WIDTH 3840 2>&1 && \
+   DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_HEIGHT 2160 2>&1; then
+    echo "  ✓ XR-0 resized"
+    sleep 2
+else
+    echo "  ✗ Failed to resize XR-0"
+fi
+
+echo ""
+echo "Arranging outputs..."
+echo "  Connecting XR-0..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --auto 2>&1; then
+    echo "  ✓ XR-0 connected"
+    sleep 1
+else
+    echo "  ⚠ Could not connect XR-0"
+fi
+
+echo ""
+echo "Deleting XR-1..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>&1; then
+    echo "  ✓ XR-1 deleted"
+    sleep 2
+else
+    echo "  ✗ Failed to delete XR-1"
+fi
+
+echo ""
+echo "Final outputs:"
+DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
+
+echo ""
+echo "=== Interactive Testing ==="
+echo "Xorg is running on display $TEST_DISPLAY (VT $TEST_VT)"
+if [ -n "$XFWM4_PID" ]; then
+    echo "Window manager (xfwm4/openbox) is running (PID: $XFWM4_PID)"
+else
+    echo "Window manager: not running"
+fi
+echo "Display Settings should be open - you can see the RandR outputs visually"
+echo ""
+echo "A dialog will appear on VT $TEST_VT - click 'Exit' when done testing..."
+
+# Show exit dialog
+if command -v zenity >/dev/null 2>&1; then
+    DISPLAY="$TEST_DISPLAY" zenity --info \
+        --title="XR Virtual Output Test" \
+        --text="XR Virtual Output Test is running on display $TEST_DISPLAY (VT $TEST_VT).\n\nClick 'OK' to exit and clean up." \
+        --width=400 --height=150 \
+        >/tmp/zenity_exit_${TEST_DISPLAY#:}.log 2>&1
+    echo "User clicked 'OK' - exiting..."
+elif command -v xmessage >/dev/null 2>&1; then
     DISPLAY="$TEST_DISPLAY" xmessage -center -buttons "Exit:0" \
         "XR Virtual Output Test is running.\n\nClick 'Exit' to clean up." \
         >/tmp/xmessage_exit_${TEST_DISPLAY#:}.log 2>&1
@@ -577,7 +803,6 @@ elif command -v xmessage >/dev/null 2>&1; then
         echo "Dialog closed - exiting..."
     fi
 else
-    # No graphical dialog available, use terminal
     echo "No graphical dialog available - press Enter to exit..."
     read -r
 fi
