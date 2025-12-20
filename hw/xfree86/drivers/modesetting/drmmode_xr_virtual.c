@@ -127,13 +127,29 @@ drmmode_xr_virtual_create_resources(xf86OutputPtr output)
 /* Custom function table for virtual XR output - initialized at runtime */
 static xf86OutputFuncsRec drmmode_xr_virtual_output_funcs;
 
+/**
+ * Custom destroy function for virtual XR outputs
+ * Only frees the driver_private structure, not DRM resources (which don't exist)
+ */
+static void
+drmmode_xr_virtual_output_destroy(xf86OutputPtr output)
+{
+    drmmode_output_private_ptr drmmode_output = output->driver_private;
+    if (drmmode_output) {
+        /* Virtual outputs don't have DRM resources to free, just free the structure */
+        free(drmmode_output);
+    }
+    output->driver_private = NULL;
+}
+
 /* Initialize the virtual output function table (called once) */
 static void
 drmmode_xr_virtual_output_funcs_init(void)
 {
-    /* Copy from the regular output funcs, but override create_resources */
+    /* Copy from the regular output funcs, but override create_resources and destroy */
     drmmode_xr_virtual_output_funcs = drmmode_output_funcs;
     drmmode_xr_virtual_output_funcs.create_resources = drmmode_xr_virtual_create_resources;
+    drmmode_xr_virtual_output_funcs.destroy = drmmode_xr_virtual_output_destroy;
 }
 
 /**
@@ -381,13 +397,8 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
         RRTellChanged(xf86ScrnToScreen(pScrn));
     }
 
-    /* Destroy xf86Output */
+    /* Destroy xf86Output - the destroy function will handle freeing driver_private */
     if (vout->output) {
-        drmmode_output_private_ptr drmmode_output = vout->output->driver_private;
-        /* Clear driver_private before destroy (destroy function might access it) */
-        vout->output->driver_private = NULL;
-        if (drmmode_output)
-            free(drmmode_output);
         xf86OutputDestroy(vout->output);
         vout->output = NULL;
     }
