@@ -2,8 +2,23 @@
 # Test script for virtual XR connector
 # WARNING: This tests with a real Xorg server on a separate display
 # Make sure you're not using display :1 before running this!
+#
+# Usage:
+#   ./test_xr_virtual.copy.sh              # Use built Xorg (default)
+#   ./test_xr_virtual.copy.sh system       # Use system Xorg (for testing/comparison)
 
 set -e
+
+# Parse command-line arguments
+USE_SYSTEM_XORG=0
+if [ "$1" = "system" ]; then
+    USE_SYSTEM_XORG=1
+    echo "Using system Xorg (for testing/comparison with VT7)"
+elif [ -n "$1" ]; then
+    echo "Usage: $0 [system]"
+    echo "  system: Use system Xorg instead of built Xorg"
+    exit 1
+fi
 
 XSRC_DIR="/home/rebroad/src/xserver"
 BUILD_DIR="$XSRC_DIR/build"
@@ -178,18 +193,44 @@ if [ -n "$RUNNING_XORG" ]; then
     echo ""
 fi
 
-# Build Xorg and required modules if not already built
-if [ ! -f "$BUILD_DIR/hw/xfree86/Xorg" ]; then
-    echo "Building Xorg..."
-    cd "$XSRC_DIR"
-    ninja -C build hw/xfree86/Xorg
+# Ensure meson build directory is configured (with secure-rpc disabled to avoid libtirpc dependency)
+# Skip if using system Xorg
+if [ $USE_SYSTEM_XORG -eq 0 ]; then
+    # Always use --reconfigure to ensure secure-rpc is disabled, especially after branch switches
+    if [ ! -d "$BUILD_DIR" ] || [ ! -f "$BUILD_DIR/build.ninja" ]; then
+        echo "Configuring meson build directory (with secure-rpc disabled)..."
+        cd "$XSRC_DIR"
+        meson setup build -Dsecure-rpc=false || {
+            echo "ERROR: Failed to configure meson build"
+            echo "Try running: cd $XSRC_DIR && meson setup build -Dsecure-rpc=false"
+            exit 1
+        }
+    else
+        # Build directory exists - reconfigure to ensure secure-rpc is disabled (safe even if already configured)
+        echo "Ensuring meson build is configured with secure-rpc disabled..."
+        cd "$XSRC_DIR"
+        meson setup build -Dsecure-rpc=false --reconfigure 2>&1 | grep -v "^The Meson build system" | grep -v "^Version:" | grep -v "^Source dir:" | grep -v "^Build dir:" || true
+    fi
+else
+    echo "Skipping meson build configuration (using system Xorg)"
 fi
 
-# Build shadow module (needed by modesetting driver)
-if [ ! -f "$BUILD_DIR/hw/xfree86/dixmods/libshadow.so" ]; then
-    echo "Building shadow module..."
-    cd "$XSRC_DIR"
-    ninja -C build hw/xfree86/dixmods/libshadow.so
+# Build Xorg and required modules if not already built (skip if using system Xorg)
+if [ $USE_SYSTEM_XORG -eq 0 ]; then
+    if [ ! -f "$BUILD_DIR/hw/xfree86/Xorg" ]; then
+        echo "Building Xorg..."
+        cd "$XSRC_DIR"
+        ninja -C build hw/xfree86/Xorg
+    fi
+fi
+
+# Build shadow module (needed by modesetting driver) - skip if using system Xorg
+if [ $USE_SYSTEM_XORG -eq 0 ]; then
+    if [ ! -f "$BUILD_DIR/hw/xfree86/dixmods/libshadow.so" ]; then
+        echo "Building shadow module..."
+        cd "$XSRC_DIR"
+        ninja -C build hw/xfree86/dixmods/libshadow.so
+    fi
 fi
 
 # Use the driver directly from the build directory - no copying needed!
@@ -197,7 +238,13 @@ fi
 # Xorg's module loader looks in subdirectories like "drivers/", "dixmods/", etc.
 # We need to point modulepath to the base module directory: build/hw/xfree86/
 # This allows Xorg to find both drivers (in drivers/) and other modules (in dixmods/, etc.)
-TEST_DRIVER_DIR="$BUILD_DIR/hw/xfree86"
+# (Only used when not using system Xorg)
+if [ $USE_SYSTEM_XORG -eq 0 ]; then
+    TEST_DRIVER_DIR="$BUILD_DIR/hw/xfree86"
+else
+    # When using system Xorg, we don't need a custom driver directory
+    TEST_DRIVER_DIR=""
+fi
 
 # Path for built libinput driver (needs to match built Xorg's ABI)
 LIBINPUT_SRC_DIR="$XSRC_DIR/../xf86-input-libinput"
@@ -214,37 +261,55 @@ NEEDS_DRIVER_REBUILD=0
 NEEDS_XORG_REBUILD=0
 NEEDS_LIBINPUT_REBUILD=0
 
-# Check if libinput driver needs to be built
-# Only rebuild if it doesn't exist - the ABI version is fixed at compile time,
-# so if libinput was built against the current Xorg ABI, it will continue to work
-# even if Xorg is rebuilt (as long as the ABI hasn't changed)
-if [ ! -f "$LIBINPUT_DRIVER" ]; then
-    echo "libinput driver not found, will build it..."
-    NEEDS_LIBINPUT_REBUILD=1
+# Check if libinput driver needs to be built (skip if using system Xorg)
+USE_SYSTEM_LIBINPUT=0
+if [ $USE_SYSTEM_XORG -eq 0 ]; then
+    # Only rebuild if it doesn't exist - the ABI version is fixed at compile time,
+    # so if libinput was built against the current Xorg ABI, it will continue to work
+    # even if Xorg is rebuilt (as long as the ABI hasn't changed)
+    # However, if Xorg ABI changed (e.g., switching branches), we need to rebuild
+    if [ ! -f "$LIBINPUT_DRIVER" ]; then
+        echo "libinput driver not found, will build it..."
+        NEEDS_LIBINPUT_REBUILD=1
+    else
+        # Check if we're on a release branch (like test-21.1.12) - if so, use system libinput
+        # because it matches the release Xorg ABI, and the built libinput might be from master branch
+        CURRENT_BRANCH=$(cd "$XSRC_DIR" && git branch --show-current 2>/dev/null || echo "")
+        if echo "$CURRENT_BRANCH" | grep -qE "(test-)?21\.1\.|xorg-server-21\.1"; then
+            echo "Detected release branch ($CURRENT_BRANCH), using system libinput driver (matches release Xorg ABI)"
+            USE_SYSTEM_LIBINPUT=1
+        fi
+    fi
+else
+    # When using system Xorg, always use system libinput
+    USE_SYSTEM_LIBINPUT=1
+    echo "Using system libinput driver (matches system Xorg)"
 fi
 
-# Check if driver needs rebuilding
-if [ ! -f "$DRIVER_BUILD" ]; then
-    echo "Driver not found, building..."
-    NEEDS_DRIVER_REBUILD=1
-elif [ -f "$DRIVER_SRC" ] && [ "$DRIVER_SRC" -nt "$DRIVER_BUILD" ]; then
-    echo "Driver source (drmmode_xr_virtual.c) is newer than built driver, rebuilding..."
-    NEEDS_DRIVER_REBUILD=1
-elif [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/driver.c" -nt "$DRIVER_BUILD" ] 2>/dev/null || \
-     [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_display.c" -nt "$DRIVER_BUILD" ] 2>/dev/null || \
-     [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_display.h" -nt "$DRIVER_BUILD" ] 2>/dev/null; then
-    echo "Driver source files are newer than built driver, rebuilding..."
-    NEEDS_DRIVER_REBUILD=1
+# Check if driver needs rebuilding (skip if using system Xorg)
+if [ $USE_SYSTEM_XORG -eq 0 ] && [ -n "$DRIVER_BUILD" ]; then
+    if [ ! -f "$DRIVER_BUILD" ]; then
+        echo "Driver not found, building..."
+        NEEDS_DRIVER_REBUILD=1
+    elif [ -f "$DRIVER_SRC" ] && [ "$DRIVER_SRC" -nt "$DRIVER_BUILD" ]; then
+        echo "Driver source (drmmode_xr_virtual.c) is newer than built driver, rebuilding..."
+        NEEDS_DRIVER_REBUILD=1
+    elif [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/driver.c" -nt "$DRIVER_BUILD" ] 2>/dev/null || \
+         [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_display.c" -nt "$DRIVER_BUILD" ] 2>/dev/null || \
+         [ "$XSRC_DIR/hw/xfree86/drivers/modesetting/drmmode_display.h" -nt "$DRIVER_BUILD" ] 2>/dev/null; then
+        echo "Driver source files are newer than built driver, rebuilding..."
+        NEEDS_DRIVER_REBUILD=1
+    fi
+
+    # Check if Xorg needs rebuilding (xf86RandR12.c is part of Xorg, not the driver)
+    if [ -f "$RANDR_SRC" ] && [ -f "$XORG_BIN" ] && [ "$RANDR_SRC" -nt "$XORG_BIN" ]; then
+        echo "RandR source (xf86RandR12.c) is newer than built Xorg, rebuilding Xorg..."
+        NEEDS_XORG_REBUILD=1
+    fi
 fi
 
-# Check if Xorg needs rebuilding (xf86RandR12.c is part of Xorg, not the driver)
-if [ -f "$RANDR_SRC" ] && [ -f "$XORG_BIN" ] && [ "$RANDR_SRC" -nt "$XORG_BIN" ]; then
-    echo "RandR source (xf86RandR12.c) is newer than built Xorg, rebuilding Xorg..."
-    NEEDS_XORG_REBUILD=1
-fi
-
-# Build libinput driver if needed
-if [ $NEEDS_LIBINPUT_REBUILD -eq 1 ]; then
+# Build libinput driver if needed (unless using system libinput)
+if [ $NEEDS_LIBINPUT_REBUILD -eq 1 ] && [ $USE_SYSTEM_LIBINPUT -eq 0 ]; then
     echo "Building xf86-input-libinput to match built Xorg's ABI..."
 
     # Clone if not exists
@@ -365,17 +430,22 @@ if [ $NEEDS_DRIVER_REBUILD -eq 1 ] || [ $NEEDS_XORG_REBUILD -eq 1 ]; then
     fi
 fi
 
-# Verify the driver exists after potential rebuild
-if [ ! -f "$DRIVER_BUILD" ]; then
-    echo "ERROR: Driver not found at $DRIVER_BUILD"
-    echo "Please build the driver first: ninja -C build hw/xfree86/drivers/modesetting/modesetting_drv.so"
-    exit 1
-fi
+# Verify the driver exists after potential rebuild (only if using built Xorg)
+if [ $USE_SYSTEM_XORG -eq 0 ]; then
+    if [ ! -f "$DRIVER_BUILD" ]; then
+        echo "ERROR: Driver not found at $DRIVER_BUILD"
+        echo "Please build the driver first: ninja -C build hw/xfree86/drivers/modesetting/modesetting_drv.so"
+        exit 1
+    fi
 
-echo "✓ Using driver directly from build directory"
-echo "  Driver: $BUILD_DIR/hw/xfree86/drivers/modesetting/modesetting_drv.so"
-echo "  Module path: $TEST_DRIVER_DIR"
-echo ""
+    echo "✓ Using driver directly from build directory"
+    echo "  Driver: $BUILD_DIR/hw/xfree86/drivers/modesetting/modesetting_drv.so"
+    echo "  Module path: $TEST_DRIVER_DIR"
+    echo ""
+else
+    echo "✓ Using system Xorg and system modules (no custom driver)"
+    echo ""
+fi
 
 # Ensure sudo password is cached before we need it (needed for Xorg startup)
 echo "Checking sudo access..."
@@ -523,19 +593,34 @@ echo ""
 # Use -modulepath to tell Xorg where to find our driver
 # Also set LD_LIBRARY_PATH in case the driver needs libraries from the build
 echo "Starting Xorg (this requires sudo)..."
-echo "Module path: $TEST_DRIVER_DIR"
-echo "Build lib path: $BUILD_DIR"
-
-# We MUST use built Xorg because we modified xf86RandR12.c
-# However, system libinput has ABI version 24 while built Xorg expects 25
-# We'll try to use evdev instead, or document that libinput needs to be built from source
-XORG_BIN="$BUILD_DIR/hw/xfree86/Xorg"
-if [ ! -f "$XORG_BIN" ]; then
-    echo "ERROR: Built Xorg not found at $XORG_BIN"
-    echo "       Run 'ninja -C build' to build Xorg"
-    exit 1
+if [ $USE_SYSTEM_XORG -eq 0 ]; then
+    echo "Module path: $MODULE_PATH"
+    echo "Build lib path: $BUILD_DIR"
+else
+    echo "Module path: $MODULE_PATH"
 fi
-echo "Using built Xorg: $XORG_BIN (required for our xf86RandR12.c changes)"
+
+# Choose Xorg binary based on command-line option
+if [ $USE_SYSTEM_XORG -eq 1 ]; then
+    XORG_BIN="/usr/bin/Xorg"
+    if [ ! -f "$XORG_BIN" ]; then
+        XORG_BIN="/usr/lib/xorg/Xorg"
+    fi
+    if [ ! -f "$XORG_BIN" ]; then
+        echo "ERROR: System Xorg not found. Tried /usr/bin/Xorg and /usr/lib/xorg/Xorg"
+        exit 1
+    fi
+    echo "Using system Xorg: $XORG_BIN (for testing/comparison with VT7)"
+else
+    # We MUST use built Xorg because we modified xf86RandR12.c
+    XORG_BIN="$BUILD_DIR/hw/xfree86/Xorg"
+    if [ ! -f "$XORG_BIN" ]; then
+        echo "ERROR: Built Xorg not found at $XORG_BIN"
+        echo "       Run 'ninja -C build' to build Xorg"
+        exit 1
+    fi
+    echo "Using built Xorg: $XORG_BIN (required for our xf86RandR12.c changes)"
+fi
 
 # Try to get more detailed error information
 # The "failed to map segment" error is often due to:
@@ -547,26 +632,50 @@ echo "Using built Xorg: $XORG_BIN (required for our xf86RandR12.c changes)"
 # IMPORTANT: Use -novtswitch to prevent this X server from switching VTs
 # This should prevent it from interfering with the running X server on VT7
 # Start Xorg in background - we'll monitor it and kill it if it hangs
-# Include built libinput driver directory (matches built Xorg's ABI)
+# Set up module path based on whether we're using system Xorg
 # Xorg looks in subdirectories (drivers/, input/, etc.) within the module path
 # NOTE: ModulePath uses COMMA as separator, not colon!
-if [ -f "$LIBINPUT_DRIVER" ]; then
+SYSTEM_MODULES="/usr/lib/xorg/modules"
+
+if [ $USE_SYSTEM_XORG -eq 1 ]; then
+    # When using system Xorg, use system modules only (no built driver/modules)
+    # This matches exactly what VT7 uses
+    if [ -d "$SYSTEM_MODULES" ]; then
+        MODULE_PATH="$SYSTEM_MODULES"
+        echo "Using system modules only (matches system Xorg)"
+    else
+        echo "ERROR: System modules directory not found at $SYSTEM_MODULES"
+        exit 1
+    fi
+elif [ $USE_SYSTEM_LIBINPUT -eq 1 ] || [ ! -f "$LIBINPUT_DRIVER" ]; then
+    # Use system libinput driver (should match release Xorg versions like 21.1.12)
+    # But still use our built modesetting driver
+    if [ -d "$SYSTEM_MODULES" ]; then
+        MODULE_PATH="$TEST_DRIVER_DIR,$SYSTEM_MODULES"
+        if [ $USE_SYSTEM_LIBINPUT -eq 1 ]; then
+            echo "Using system libinput driver (matches release Xorg ABI)"
+        else
+            echo "Using system libinput driver (built driver not found)"
+        fi
+    else
+        MODULE_PATH="$TEST_DRIVER_DIR"
+        echo "WARNING: System modules directory not found, input devices may not work"
+    fi
+else
     # Use built libinput driver (ABI matches built Xorg)
     LIBINPUT_MODULE_DIR="$(dirname "$LIBINPUT_DRIVER")"
     MODULE_PATH="$TEST_DRIVER_DIR,$LIBINPUT_MODULE_DIR"
     echo "Using built libinput driver: $LIBINPUT_DRIVER"
-else
-    # Fallback to system modules (will have ABI mismatch, but at least Xorg will start)
-    SYSTEM_MODULES="/usr/lib/xorg/modules"
-    if [ -d "$SYSTEM_MODULES" ]; then
-        MODULE_PATH="$TEST_DRIVER_DIR,$SYSTEM_MODULES"
-        echo "WARNING: Using system libinput (ABI mismatch expected)"
-    else
-        MODULE_PATH="$TEST_DRIVER_DIR"
-    fi
 fi
 
-sudo env LD_LIBRARY_PATH="$BUILD_DIR:$LD_LIBRARY_PATH" \
+# Set up environment - only use BUILD_DIR in LD_LIBRARY_PATH if using built Xorg
+if [ $USE_SYSTEM_XORG -eq 0 ]; then
+    XORG_ENV="LD_LIBRARY_PATH=\"$BUILD_DIR:\$LD_LIBRARY_PATH\""
+else
+    XORG_ENV=""
+fi
+
+sudo env $XORG_ENV \
     "$XORG_BIN" "$TEST_DISPLAY" \
     -config /tmp/test-xorg.conf \
     -modulepath "$MODULE_PATH" \
@@ -685,16 +794,75 @@ if [ $WM_STARTED -eq 0 ]; then
 fi
 echo ""
 
+echo "[$(date '+%H:%M:%S')] === DBus Session Probe ==="
+echo "Checking DBus session bus availability (needed for Display Settings to apply changes)..."
+if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    echo "  DBUS_SESSION_BUS_ADDRESS is set: $DBUS_SESSION_BUS_ADDRESS"
+    # Try to connect to the session bus
+    if command -v dbus-send >/dev/null 2>&1; then
+        if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId >/dev/null 2>&1; then
+            echo "  ✓ DBus session bus is accessible"
+        else
+            echo "  ✗ DBus session bus address set but not accessible"
+            echo "     Display Settings may not be able to apply changes"
+        fi
+    fi
+else
+    echo "  ✗ DBUS_SESSION_BUS_ADDRESS is not set"
+    # Try to set it from the user session bus
+    USER_BUS="/run/user/$(id -u)/bus"
+    if [ -S "$USER_BUS" ]; then
+        echo "  Found user session bus at $USER_BUS"
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$USER_BUS"
+        echo "  Set DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+        if command -v dbus-send >/dev/null 2>&1; then
+            if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId >/dev/null 2>&1; then
+                echo "  ✓ DBus session bus is now accessible"
+            else
+                echo "  ✗ DBus session bus still not accessible after setting"
+            fi
+        fi
+    else
+        echo "  User session bus not found at $USER_BUS"
+        echo "  Display Settings may not be able to apply changes without DBus"
+    fi
+fi
+
+# Check for XFCE-specific DBus services that Display Settings might need
+echo ""
+echo "Checking for XFCE settings daemon (xfconfd) - needed for Display Settings to apply changes..."
+if command -v dbus-send >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.xfce.Xfconf >/dev/null 2>&1; then
+        XFCONF_RUNNING=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.xfce.Xfconf 2>/dev/null | grep -o "boolean true" || echo "")
+        if [ -n "$XFCONF_RUNNING" ]; then
+            echo "  ✓ xfconfd (org.xfce.Xfconf) is running on session bus"
+        else
+            echo "  ✗ xfconfd (org.xfce.Xfconf) is NOT running on session bus"
+            echo "     Display Settings may not be able to apply changes without xfconfd"
+            echo "     Note: xfconfd is typically started by xfce4-session, which is not running in this test environment"
+        fi
+    else
+        echo "  ⚠ Could not query DBus for xfconfd status"
+    fi
+else
+    echo "  ⚠ Cannot check for xfconfd (dbus-send not available or DBUS_SESSION_BUS_ADDRESS not set)"
+fi
+echo ""
+
 echo "[$(date '+%H:%M:%S')] === Launching XFCE4 Display Settings ==="
 DISPLAY_SETTINGS_PID=""
 if command -v xfce4-display-settings >/dev/null 2>&1; then
     echo "[$(date '+%H:%M:%S')] Launching XFCE4 Display Settings (xfce4-display-settings)..."
-    DISPLAY="$TEST_DISPLAY" xfce4-display-settings >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
+    # Export DBUS_SESSION_BUS_ADDRESS if we set it above
+    DISPLAY="$TEST_DISPLAY" env ${DBUS_SESSION_BUS_ADDRESS:+DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"} xfce4-display-settings >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
     DISPLAY_SETTINGS_PID=$!
     sleep 3
     if kill -0 $DISPLAY_SETTINGS_PID 2>/dev/null; then
         echo "✓ Display Settings launched (PID: $DISPLAY_SETTINGS_PID)"
         echo "  You should see the Display Settings window showing RandR outputs"
+        if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+            echo "  ⚠ WARNING: DBUS_SESSION_BUS_ADDRESS not set - Display Settings may not be able to apply changes"
+        fi
     else
         echo "⚠ Display Settings exited immediately (check /tmp/display_settings_${TEST_DISPLAY#:}.log)"
         if [ -f /tmp/display_settings_${TEST_DISPLAY#:}.log ]; then
@@ -769,8 +937,8 @@ else
 fi
 echo ""
 
-# Test 1: Check if XR-Manager appears in xrandr
-echo "=== Test 1: Check if XR-Manager appears in xrandr ==="
+# Test 1: List all outputs
+echo "=== Test 1: List all outputs ==="
 echo "All outputs:"
 DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" || DISPLAY="$TEST_DISPLAY" xrandr 2>&1
 echo ""
@@ -780,86 +948,102 @@ echo "=== Test 2: List all monitors ==="
 DISPLAY="$TEST_DISPLAY" xrandr --listmonitors
 echo ""
 
-# Test 3: Automated XR Output Tests
-echo "=== Test 3: Automated XR Output Tests ==="
-echo "Waiting a moment for Display Settings to fully open..."
-sleep 2
+# XR-specific tests (only for custom-built Xorg with XR support)
+if [ $USE_SYSTEM_XORG -eq 0 ]; then
+    # Test 3: Check if XR-Manager appears in xrandr
+    echo "=== Test 3: Check if XR-Manager appears in xrandr ==="
+    if DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -q "^XR-Manager"; then
+        echo "✓ XR-Manager found in xrandr output"
+    else
+        echo "✗ XR-Manager not found (this is expected if XR support is not enabled)"
+    fi
+    echo ""
 
-echo ""
-echo "Creating virtual XR outputs..."
-echo "  Creating XR-0 (1920x1080@60Hz)..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-0:1920:1080:60" 2>&1; then
-    echo "  ✓ XR-0 created"
+    # Test 4: Automated XR Output Tests
+    echo "=== Test 4: Automated XR Output Tests ==="
+    echo "Waiting a moment for Display Settings to fully open..."
     sleep 2
+
+    echo ""
+    echo "Creating virtual XR outputs..."
+    echo "  Creating XR-0 (1920x1080@60Hz)..."
+    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-0:1920:1080:60" 2>&1; then
+        echo "  ✓ XR-0 created"
+        sleep 2
+    else
+        echo "  ✗ Failed to create XR-0"
+    fi
+
+    echo "  Creating XR-1 (2560x1440@60Hz)..."
+    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-1:2560:1440:60" 2>&1; then
+        echo "  ✓ XR-1 created"
+        sleep 2
+    else
+        echo "  ✗ Failed to create XR-1"
+    fi
+
+    # Enable the created XR outputs so they show as active (blue) in Display Settings
+    echo ""
+    echo "Enabling XR outputs so they appear active in Display Settings..."
+    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --auto 2>&1; then
+        echo "  ✓ XR-0 enabled"
+    fi
+    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-1 --auto 2>&1; then
+        echo "  ✓ XR-1 enabled"
+    fi
+    sleep 1
+
+    echo ""
+    echo "Current outputs:"
+    DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
+
+    echo ""
+    echo "XR outputs created. Please verify they appear in Display Settings before we proceed with resizing and deletion tests."
+    echo "Note: Outputs are created as 'connected' so they should be visible in Display Settings."
+    if command -v zenity >/dev/null 2>&1; then
+        DISPLAY="$TEST_DISPLAY" zenity --info --title "XR Output Test" \
+            --text "XR-0 and XR-1 have been created.\n\nPlease check Display Settings to verify they appear.\n\nClick OK when ready to proceed with resizing and deletion tests." \
+            2>/dev/null || echo "  (zenity dialog closed or failed)"
+    elif command -v xmessage >/dev/null 2>&1; then
+        DISPLAY="$TEST_DISPLAY" xmessage -center -timeout 0 \
+            "XR-0 and XR-1 have been created. Please check Display Settings to verify they appear. Click OK when ready to proceed with resizing and deletion tests." \
+            2>/dev/null || echo "  (xmessage dialog closed)"
+    else
+        echo "  Press Enter when ready to proceed with resizing and deletion tests..."
+        read -r
+    fi
+
+    echo ""
+    echo "Resizing XR-0 to 3840x2160..."
+    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_WIDTH 3840 2>&1 && \
+       DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_HEIGHT 2160 2>&1; then
+        echo "  ✓ XR-0 resized"
+        sleep 2
+    else
+        echo "  ✗ Failed to resize XR-0"
+    fi
+
+    echo ""
+    echo "Deleting XR-1..."
+    # Suppress stderr since we expect a BadRROutput error (xrandr queries before deletion completes)
+    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>/dev/null; then
+        echo "  ✓ XR-1 deleted"
+    else
+        # The deletion actually succeeds, but xrandr reports an error because it queries the output
+        # during the property change operation, before the deletion completes
+        echo "  ✓ XR-1 deleted (xrandr reported an error, but deletion succeeded - see final outputs below)"
+    fi
+    # Wait a moment for RandR changes to propagate
+    sleep 1
+
+    echo ""
+    echo "Final outputs:"
+    DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
 else
-    echo "  ✗ Failed to create XR-0"
+    echo "=== XR Tests Skipped (using system Xorg) ==="
+    echo "XR-specific tests are only available with custom-built Xorg that includes XR support."
+    echo ""
 fi
-
-echo "  Creating XR-1 (2560x1440@60Hz)..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-1:2560:1440:60" 2>&1; then
-    echo "  ✓ XR-1 created"
-    sleep 2
-else
-    echo "  ✗ Failed to create XR-1"
-fi
-
-# Enable the created XR outputs so they show as active (blue) in Display Settings
-echo ""
-echo "Enabling XR outputs so they appear active in Display Settings..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --auto 2>&1; then
-    echo "  ✓ XR-0 enabled"
-fi
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-1 --auto 2>&1; then
-    echo "  ✓ XR-1 enabled"
-fi
-sleep 1
-
-echo ""
-echo "Current outputs:"
-DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
-
-echo ""
-echo "XR outputs created. Please verify they appear in Display Settings before we proceed with resizing and deletion tests."
-echo "Note: Outputs are created as 'connected' so they should be visible in Display Settings."
-if command -v zenity >/dev/null 2>&1; then
-    DISPLAY="$TEST_DISPLAY" zenity --info --title "XR Output Test" \
-        --text "XR-0 and XR-1 have been created.\n\nPlease check Display Settings to verify they appear.\n\nClick OK when ready to proceed with resizing and deletion tests." \
-        2>/dev/null || echo "  (zenity dialog closed or failed)"
-elif command -v xmessage >/dev/null 2>&1; then
-    DISPLAY="$TEST_DISPLAY" xmessage -center -timeout 0 \
-        "XR-0 and XR-1 have been created. Please check Display Settings to verify they appear. Click OK when ready to proceed with resizing and deletion tests." \
-        2>/dev/null || echo "  (xmessage dialog closed)"
-else
-    echo "  Press Enter when ready to proceed with resizing and deletion tests..."
-    read -r
-fi
-
-echo ""
-echo "Resizing XR-0 to 3840x2160..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_WIDTH 3840 2>&1 && \
-   DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_HEIGHT 2160 2>&1; then
-    echo "  ✓ XR-0 resized"
-    sleep 2
-else
-    echo "  ✗ Failed to resize XR-0"
-fi
-
-echo ""
-echo "Deleting XR-1..."
-# Suppress stderr since we expect a BadRROutput error (xrandr queries before deletion completes)
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>/dev/null; then
-    echo "  ✓ XR-1 deleted"
-else
-    # The deletion actually succeeds, but xrandr reports an error because it queries the output
-    # during the property change operation, before the deletion completes
-    echo "  ✓ XR-1 deleted (xrandr reported an error, but deletion succeeded - see final outputs below)"
-fi
-# Wait a moment for RandR changes to propagate
-sleep 1
-
-echo ""
-echo "Final outputs:"
-DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
 
 echo ""
 echo "=== Interactive Testing ==="
@@ -870,6 +1054,39 @@ else
     echo "Window manager: not running"
 fi
 echo "Display Settings should be open - you can see the RandR outputs visually"
+echo ""
+echo "=== Diagnostic: Testing if RandR works via command line ==="
+echo "Testing if we can disable eDP-1 via xrandr command line..."
+if DISPLAY="$TEST_DISPLAY" xrandr --output eDP-1 --off 2>&1; then
+    echo "✓ SUCCESS: xrandr --output eDP-1 --off worked (RandR is functional)"
+    sleep 2
+    echo "Re-enabling eDP-1 (positioned below external monitor to avoid mirroring)..."
+    # Get external monitor info to position eDP-1 correctly
+    EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
+    if [ -n "$EXTERNAL_MONITOR" ]; then
+        EXTERNAL_HEIGHT=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "[0-9]+x[0-9]+" | head -1 | cut -dx -f2)
+        if [ -n "$EXTERNAL_HEIGHT" ]; then
+            DISPLAY="$TEST_DISPLAY" xrandr --output eDP-1 --auto --pos 0x${EXTERNAL_HEIGHT} 2>&1
+            echo "  eDP-1 positioned at y=${EXTERNAL_HEIGHT} (below $EXTERNAL_MONITOR)"
+        else
+            DISPLAY="$TEST_DISPLAY" xrandr --output eDP-1 --auto --right-of "$EXTERNAL_MONITOR" 2>&1
+            echo "  eDP-1 positioned to the right of $EXTERNAL_MONITOR"
+        fi
+    else
+        DISPLAY="$TEST_DISPLAY" xrandr --output eDP-1 --auto 2>&1
+    fi
+    echo ""
+    echo "If Display Settings GUI cannot toggle displays but xrandr commands work,"
+    echo "this indicates a Display Settings tool issue (likely DBus/session related),"
+    echo "NOT an Xorg/RandR issue."
+    echo ""
+    echo "Possible causes:"
+    echo "  - xfconfd (XFCE settings daemon) not running (needed for Display Settings to apply changes)"
+    echo "  - Display Settings may require a full XFCE session context"
+    echo "  - Version mismatch between Display Settings and Xorg"
+else
+    echo "✗ FAILED: xrandr command failed (RandR issue)"
+fi
 echo ""
 echo "Waiting for Display Settings to be closed (this will exit the test session)..."
 if [ -n "$DISPLAY_SETTINGS_PID" ]; then
