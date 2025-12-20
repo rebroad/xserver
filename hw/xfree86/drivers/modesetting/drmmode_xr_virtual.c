@@ -366,18 +366,30 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
     else
         ms->xr_virtual_outputs = vout->next;
 
-    /* Destroy RandR output */
+    /* Disconnect output from any CRTC first */
+    if (vout->output && vout->output->crtc) {
+        vout->output->crtc = NULL;
+    }
+
+    /* Destroy RandR output first (before xf86Output) */
     if (vout->randr_output) {
+        /* Clear the pointer in xf86Output before destroying */
+        if (vout->output)
+            vout->output->randr_output = NULL;
         RROutputDestroy(vout->randr_output);
+        vout->randr_output = NULL;
         RRTellChanged(xf86ScrnToScreen(pScrn));
     }
 
     /* Destroy xf86Output */
     if (vout->output) {
         drmmode_output_private_ptr drmmode_output = vout->output->driver_private;
+        /* Clear driver_private before destroy (destroy function might access it) */
+        vout->output->driver_private = NULL;
         if (drmmode_output)
             free(drmmode_output);
         xf86OutputDestroy(vout->output);
+        vout->output = NULL;
     }
 
     /* Free name and record */
