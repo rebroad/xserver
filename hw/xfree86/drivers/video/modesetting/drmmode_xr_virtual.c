@@ -382,13 +382,19 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
     else
         ms->xr_virtual_outputs = vout->next;
 
-    /* Disconnect output from any CRTC first */
+    /* Disconnect output from any CRTC first (both xf86 and RandR) */
     if (vout->output && vout->output->crtc) {
         vout->output->crtc = NULL;
     }
 
     /* Destroy RandR output first (before xf86Output) */
     if (vout->randr_output) {
+        /* Disconnect from RandR CRTC if connected */
+        if (vout->randr_output->crtc) {
+            vout->randr_output->crtc = NULL;
+        }
+        /* Mark as disconnected before destroying */
+        RROutputSetConnection(vout->randr_output, RR_Disconnected);
         /* Clear the pointer in xf86Output before destroying */
         if (vout->output)
             vout->output->randr_output = NULL;
