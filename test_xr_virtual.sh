@@ -14,6 +14,19 @@ XORG_PID=""
 XORG_START_TIME=""
 ORIGINAL_VT=""
 
+# Set up logging: all output goes to both stdout and log file
+XRANDR_LOG="/tmp/xrandr_test_${TEST_DISPLAY#:}.log"
+rm -f "$XRANDR_LOG"
+touch "$XRANDR_LOG"
+
+# Save original stdout and stderr
+exec 3>&1
+exec 4>&2
+
+# Redirect all output to both stdout and log file
+exec > >(tee -a "$XRANDR_LOG")
+exec 2>&1
+
 # Cleanup function to ensure Xorg is always killed
 cleanup_xorg() {
     local cleanup_time=$(date +%s)
@@ -622,12 +635,22 @@ if command -v xlogo >/dev/null 2>&1; then
     fi
 
     if [ -n "$OUTPUT_INFO" ]; then
+        # Track unique positions to avoid duplicate XLogos on same display
+        # Use a temp file to track positions since arrays don't work in subshells
+        rm -f /tmp/xlogo_positions.txt
         echo "$OUTPUT_INFO" | while read output x_pos y_pos; do
-            win_x=$((x_pos + 100))
-            win_y=$((y_pos + 100))
-            DISPLAY="$TEST_DISPLAY" xlogo -geometry 200x200+${win_x}+${win_y} >/tmp/xlogo_${output}.log 2>&1 &
-            echo $! >> /tmp/xlogo_pids.txt
+            # Create a unique key for this position
+            pos_key="${x_pos}_${y_pos}"
+            # Only launch one XLogo per unique position
+            if ! grep -q "^${pos_key}$" /tmp/xlogo_positions.txt 2>/dev/null; then
+                echo "${pos_key}" >> /tmp/xlogo_positions.txt
+                win_x=$((x_pos + 100))
+                win_y=$((y_pos + 100))
+                DISPLAY="$TEST_DISPLAY" xlogo -geometry 200x200+${win_x}+${win_y} >/tmp/xlogo_${output}.log 2>&1 &
+                echo $! >> /tmp/xlogo_pids.txt
+            fi
         done
+        rm -f /tmp/xlogo_positions.txt
 
         if [ -f /tmp/xlogo_pids.txt ]; then
             XLOGO_PIDS=$(cat /tmp/xlogo_pids.txt | tr '\n' ' ')
@@ -848,16 +871,27 @@ if command -v xfce4-display-settings >/dev/null 2>&1; then
             X_POS=$(echo "$MONITOR_POS" | cut -d+ -f2)
             Y_POS=$(echo "$MONITOR_POS" | cut -d+ -f3)
             echo "  Positioning on external monitor $EXTERNAL_MONITOR at +${X_POS}+${Y_POS}"
-            DISPLAY="$TEST_DISPLAY" xfce4-display-settings --geometry +${X_POS}+${Y_POS} >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
+            # xfce4-display-settings doesn't support --geometry, use wmctrl after launch
+            DISPLAY="$TEST_DISPLAY" xfce4-display-settings >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
+            DISPLAY_SETTINGS_PID=$!
+            sleep 1
+            # Try to move window using wmctrl if available
+            if command -v wmctrl >/dev/null 2>&1 && [ -n "$DISPLAY_SETTINGS_PID" ]; then
+                WINDOW_ID=$(DISPLAY="$TEST_DISPLAY" wmctrl -l 2>/dev/null | grep -i "display\|settings\|xfce" | awk '{print $1}' | head -1)
+                if [ -n "$WINDOW_ID" ]; then
+                    DISPLAY="$TEST_DISPLAY" wmctrl -i -r "$WINDOW_ID" -e 0,$X_POS,$Y_POS,-1,-1 2>/dev/null || true
+                fi
+            fi
         else
             DISPLAY="$TEST_DISPLAY" xfce4-display-settings >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
+            DISPLAY_SETTINGS_PID=$!
         fi
     else
         DISPLAY="$TEST_DISPLAY" xfce4-display-settings >/tmp/display_settings_${TEST_DISPLAY#:}.log 2>&1 &
+        DISPLAY_SETTINGS_PID=$!
     fi
 
-    DISPLAY_SETTINGS_PID=$!
-    sleep 2  # Give it time to open
+    sleep 3  # Give it more time to open
     if kill -0 $DISPLAY_SETTINGS_PID 2>/dev/null; then
         echo "✓ Display Settings launched (PID: $DISPLAY_SETTINGS_PID)"
         if [ -n "$EXTERNAL_MONITOR" ]; then
@@ -865,7 +899,11 @@ if command -v xfce4-display-settings >/dev/null 2>&1; then
         fi
         echo "  You should see the Display Settings window showing RandR outputs"
     else
-        echo "⚠ Display Settings may have exited immediately (check /tmp/display_settings_${TEST_DISPLAY#:}.log)"
+        echo "⚠ Display Settings exited immediately (check /tmp/display_settings_${TEST_DISPLAY#:}.log)"
+        if [ -f /tmp/display_settings_${TEST_DISPLAY#:}.log ]; then
+            echo "  Last 10 lines of log:"
+            tail -10 /tmp/display_settings_${TEST_DISPLAY#:}.log | sed 's/^/    /'
+        fi
         DISPLAY_SETTINGS_PID=""
     fi
 else
@@ -878,11 +916,44 @@ echo "=== Test 11: Automated XR Output Tests ==="
 echo "Waiting 5 seconds for Display Settings to fully open..."
 sleep 5
 
-# Test creating XR outputs
+# Launch xterm to show all test output in real-time on VT8
+XRANDR_TERM_PID=""
+if command -v xterm >/dev/null 2>&1; then
+    # Position xterm on external monitor if available, otherwise on laptop
+    EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
+    if [ -n "$EXTERNAL_MONITOR" ]; then
+        MONITOR_POS=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "\+[0-9]+\+[0-9]+" | head -1)
+        if [ -n "$MONITOR_POS" ]; then
+            X_POS=$(echo "$MONITOR_POS" | cut -d+ -f2)
+            Y_POS=$(echo "$MONITOR_POS" | cut -d+ -f3)
+            TERM_X=$((X_POS + 50))
+            TERM_Y=$((Y_POS + 50))
+        else
+            TERM_X=50
+            TERM_Y=50
+        fi
+    else
+        TERM_X=50
+        TERM_Y=50
+    fi
+
+    echo "Launching xterm to show all test output on VT $TEST_VT..."
+    DISPLAY="$TEST_DISPLAY" xterm -geometry 100x30+${TERM_X}+${TERM_Y} -title "XRandR Test Output" -e bash -c "tail -f '$XRANDR_LOG'" >/tmp/xrandr_term_${TEST_DISPLAY#:}.log 2>&1 &
+    XRANDR_TERM_PID=$!
+    sleep 1
+    if kill -0 $XRANDR_TERM_PID 2>/dev/null; then
+        echo "✓ xterm launched (PID: $XRANDR_TERM_PID) - you should see it on VT $TEST_VT"
+    else
+        echo "⚠ xterm failed to launch"
+        XRANDR_TERM_PID=""
+    fi
+fi
+
+# All output is already going to both stdout and log file via exec redirection
 echo ""
 echo "Creating virtual XR outputs..."
 echo "  Creating XR-0 (1920x1080@60Hz)..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-0:1920:1080:60" 2>/dev/null; then
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-0:1920:1080:60" 2>&1; then
     echo "  ✓ XR-0 created"
     sleep 2  # Give it time to appear
 else
@@ -890,7 +961,7 @@ else
 fi
 
 echo "  Creating XR-1 (2560x1440@60Hz)..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-1:2560:1440:60" 2>/dev/null; then
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-1:2560:1440:60" 2>&1; then
     echo "  ✓ XR-1 created"
     sleep 2
 else
@@ -900,13 +971,13 @@ fi
 # List outputs
 echo ""
 echo "Current outputs:"
-DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | head -10
+DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
 
 # Test resizing
 echo ""
 echo "Resizing XR-0 to 3840x2160..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_WIDTH 3840 2>/dev/null && \
-   DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_HEIGHT 2160 2>/dev/null; then
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_WIDTH 3840 2>&1 && \
+   DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_HEIGHT 2160 2>&1; then
     echo "  ✓ XR-0 resized"
     sleep 2
 else
@@ -917,7 +988,7 @@ fi
 echo ""
 echo "Arranging outputs..."
 echo "  Connecting XR-0..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --auto 2>/dev/null; then
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --auto 2>&1; then
     echo "  ✓ XR-0 connected"
     sleep 1
 else
@@ -927,7 +998,7 @@ fi
 # Test deleting
 echo ""
 echo "Deleting XR-1..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>/dev/null; then
+if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>&1; then
     echo "  ✓ XR-1 deleted"
     sleep 2
 else
@@ -937,7 +1008,7 @@ fi
 # Final output list
 echo ""
 echo "Final outputs:"
-DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E "^[A-Z]" | head -10
+DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
 
 echo ""
 echo "=== Interactive Testing ==="
@@ -1061,6 +1132,13 @@ if [ -n "$DISPLAY_SETTINGS_PID" ] && kill -0 $DISPLAY_SETTINGS_PID 2>/dev/null; 
     echo "Closing Display Settings..."
     kill $DISPLAY_SETTINGS_PID 2>/dev/null || true
     wait $DISPLAY_SETTINGS_PID 2>/dev/null || true
+fi
+
+# Kill xterm if still running
+if [ -n "$XRANDR_TERM_PID" ] && kill -0 $XRANDR_TERM_PID 2>/dev/null; then
+    echo "Closing xterm..."
+    kill $XRANDR_TERM_PID 2>/dev/null || true
+    wait $XRANDR_TERM_PID 2>/dev/null || true
 fi
 
 # Kill XLogo if still running
