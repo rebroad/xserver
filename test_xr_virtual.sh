@@ -111,12 +111,12 @@ cleanup_xorg() {
             fi
             sudo kill -9 "$XORG_PID_ON_DISPLAY" 2>/dev/null || true
             force_killed=1
+            sleep 0.5
         fi
         killed_by_socket=1
     fi
 
     # Verify it's really dead
-    sleep 0.5
     if lsof "/tmp/.X11-unix/X${TEST_DISPLAY#:}" >/dev/null 2>&1; then
         if [ $quick_exit -eq 0 ]; then
             echo "WARNING: Xorg socket still exists, trying one more time..."
@@ -830,22 +830,63 @@ fi
 
 # Check for XFCE-specific DBus services that Display Settings might need
 echo ""
-echo "Checking for XFCE settings daemon (xfconfd) - needed for Display Settings to apply changes..."
+echo "Checking for XFCE services needed by Display Settings..."
+XFSETTINGSD_PID=""
+XFCONF_RUNNING=""
+SETTINGS_DAEMON_RUNNING=""
+
 if command -v dbus-send >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    # Check for xfconfd
     if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.xfce.Xfconf >/dev/null 2>&1; then
         XFCONF_RUNNING=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.xfce.Xfconf 2>/dev/null | grep -o "boolean true" || echo "")
         if [ -n "$XFCONF_RUNNING" ]; then
             echo "  ✓ xfconfd (org.xfce.Xfconf) is running on session bus"
         else
             echo "  ✗ xfconfd (org.xfce.Xfconf) is NOT running on session bus"
-            echo "     Display Settings may not be able to apply changes without xfconfd"
-            echo "     Note: xfconfd is typically started by xfce4-session, which is not running in this test environment"
         fi
-    else
-        echo "  ⚠ Could not query DBus for xfconfd status"
+    fi
+
+    # Check for Settings Daemon (xfsettingsd) - this is critical for Display Settings to apply changes
+    if dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.xfce.SettingsDaemon >/dev/null 2>&1; then
+        SETTINGS_DAEMON_RUNNING=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.xfce.SettingsDaemon 2>/dev/null | grep -o "boolean true" || echo "")
+        if [ -n "$SETTINGS_DAEMON_RUNNING" ]; then
+            echo "  ✓ xfsettingsd (org.xfce.SettingsDaemon) is running on session bus"
+        else
+            echo "  ✗ xfsettingsd (org.xfce.SettingsDaemon) is NOT running on session bus"
+            echo "     This is likely why Display Settings cannot apply changes!"
+        fi
     fi
 else
-    echo "  ⚠ Cannot check for xfconfd (dbus-send not available or DBUS_SESSION_BUS_ADDRESS not set)"
+    echo "  ⚠ Cannot check for XFCE services (dbus-send not available or DBUS_SESSION_BUS_ADDRESS not set)"
+fi
+
+# Start xfsettingsd if it's not running (needed for Display Settings to apply changes)
+if [ -z "$SETTINGS_DAEMON_RUNNING" ] && command -v xfsettingsd >/dev/null 2>&1; then
+    echo ""
+    echo "Starting xfsettingsd (XFCE Settings Daemon) - required for Display Settings to apply changes..."
+    DISPLAY="$TEST_DISPLAY" env ${DBUS_SESSION_BUS_ADDRESS:+DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"} xfsettingsd >/tmp/xfsettingsd_${TEST_DISPLAY#:}.log 2>&1 &
+    XFSETTINGSD_PID=$!
+    sleep 2
+    if kill -0 $XFSETTINGSD_PID 2>/dev/null; then
+        echo "  ✓ xfsettingsd started (PID: $XFSETTINGSD_PID)"
+        # Wait a moment for it to register on DBus
+        sleep 1
+        # Verify it's now on DBus
+        if command -v dbus-send >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+            SETTINGS_DAEMON_RUNNING=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.xfce.SettingsDaemon 2>/dev/null | grep -o "boolean true" || echo "")
+            if [ -n "$SETTINGS_DAEMON_RUNNING" ]; then
+                echo "  ✓ xfsettingsd is now registered on DBus"
+            else
+                echo "  ⚠ xfsettingsd started but not yet visible on DBus (may need more time)"
+            fi
+        fi
+    else
+        echo "  ✗ xfsettingsd failed to start (check /tmp/xfsettingsd_${TEST_DISPLAY#:}.log)"
+        XFSETTINGSD_PID=""
+    fi
+elif [ -z "$SETTINGS_DAEMON_RUNNING" ]; then
+    echo ""
+    echo "  ⚠ WARNING: xfsettingsd is not running and not available - Display Settings may not be able to apply changes"
 fi
 echo ""
 
@@ -1108,6 +1149,9 @@ fi
 echo ""
 echo "=== Cleanup ==="
 
+# Cleanup Xorg
+cleanup_xorg "user requested exit"
+
 # Kill xterm if still running
 if [ -n "$XRANDR_TERM_PID" ] && kill -0 $XRANDR_TERM_PID 2>/dev/null; then
     echo "Closing xterm..."
@@ -1115,19 +1159,25 @@ if [ -n "$XRANDR_TERM_PID" ] && kill -0 $XRANDR_TERM_PID 2>/dev/null; then
     wait $XRANDR_TERM_PID 2>/dev/null || true
 fi
 
+# Kill xfsettingsd if still running
+if [ -n "$XFSETTINGSD_PID" ] && kill -0 $XFSETTINGSD_PID 2>/dev/null; then
+    echo "Stopping xfsettingsd..."
+    kill $XFSETTINGSD_PID 2>/dev/null || true
+    sleep 0.5
+    if kill -0 $XFSETTINGSD_PID 2>/dev/null; then
+        kill -9 $XFSETTINGSD_PID 2>/dev/null || true
+    fi
+fi
 
 # Kill window manager if still running
 if [ -n "$XFWM4_PID" ] && kill -0 $XFWM4_PID 2>/dev/null; then
     echo "Stopping window manager..."
     kill $XFWM4_PID 2>/dev/null || true
-    sleep 1
+    sleep 0.5
     if kill -0 $XFWM4_PID 2>/dev/null; then
         kill -9 $XFWM4_PID 2>/dev/null || true
     fi
 fi
-
-# Cleanup Xorg
-cleanup_xorg "user requested exit"
 
 # Switch back to original VT if we can
 if [ -n "$ORIGINAL_VT" ] && [ "$ORIGINAL_VT" != "$TEST_VT" ]; then
