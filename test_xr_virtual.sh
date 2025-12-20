@@ -813,8 +813,16 @@ echo "Display Settings should be open - you can see the RandR outputs visually"
 echo ""
 echo "Waiting for Display Settings to be closed (this will exit the test session)..."
 if [ -n "$DISPLAY_SETTINGS_PID" ]; then
-    wait $DISPLAY_SETTINGS_PID 2>/dev/null || true
-    echo "Display Settings closed - exiting..."
+    # Check if Xorg is still running
+    if ! kill -0 $XORG_PID 2>/dev/null; then
+        echo "WARNING: Xorg process ($XORG_PID) is not running - server may have crashed"
+        echo "Check Xorg log: $TEST_LOG"
+        echo "Display Settings may still be running, but X server is gone"
+        echo "Proceeding to cleanup..."
+    else
+        wait $DISPLAY_SETTINGS_PID 2>/dev/null || true
+        echo "Display Settings closed - exiting..."
+    fi
 else
     echo "Display Settings was not running - press Enter to exit..."
     read -r
