@@ -729,6 +729,9 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
     if (output->randr_output) {
         xf86DrvMsg(pScrn->scrnIndex, X_INFO,
                    "XR-Manager RandR output already exists, ensuring properties are registered\n");
+        /* Re-apply non-desktop and disconnected status (xf86RandR12SetInfo12 may have reset them) */
+        RROutputSetConnection(output->randr_output, RR_Disconnected);
+        RROutputSetNonDesktop(output->randr_output, TRUE);
         /* Fall through to register properties */
     } else {
 

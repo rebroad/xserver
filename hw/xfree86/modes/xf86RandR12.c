@@ -1696,6 +1696,9 @@ xf86RandR12SetInfo12(ScreenPtr pScreen)
 
         RROutputSetSubpixelOrder(output->randr_output, output->subpixel_order);
 
+        /* Preserve non-desktop property if set by driver */
+        RROutputSetNonDesktop(output->randr_output, output->non_desktop);
+
         /*
          * Valid clones
          */
