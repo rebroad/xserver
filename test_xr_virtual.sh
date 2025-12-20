@@ -1153,38 +1153,16 @@ else
 fi
 echo "Display Settings should be open - you can see the RandR outputs visually"
 echo ""
-echo "=== Diagnostic: Testing if RandR works via command line ==="
-echo "Testing if we can disable eDP-1 via xrandr command line..."
-if DISPLAY="$TEST_DISPLAY" xrandr --output eDP-1 --off 2>&1; then
-    echo "✓ SUCCESS: xrandr --output eDP-1 --off worked (RandR is functional)"
-    sleep 2
-    echo "Re-enabling eDP-1 (positioned below external monitor to avoid mirroring)..."
-    # Get external monitor info to position eDP-1 correctly
-    EXTERNAL_MONITOR=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep -E " connected" | grep -v "eDP" | head -1 | awk '{print $1}')
-    if [ -n "$EXTERNAL_MONITOR" ]; then
-        EXTERNAL_HEIGHT=$(DISPLAY="$TEST_DISPLAY" xrandr 2>/dev/null | grep "^$EXTERNAL_MONITOR" | grep -oE "[0-9]+x[0-9]+" | head -1 | cut -dx -f2)
-        if [ -n "$EXTERNAL_HEIGHT" ]; then
-            DISPLAY="$TEST_DISPLAY" xrandr --output eDP-1 --auto --pos 0x${EXTERNAL_HEIGHT} 2>&1
-            echo "  eDP-1 positioned at y=${EXTERNAL_HEIGHT} (below $EXTERNAL_MONITOR)"
-        else
-            DISPLAY="$TEST_DISPLAY" xrandr --output eDP-1 --auto --right-of "$EXTERNAL_MONITOR" 2>&1
-            echo "  eDP-1 positioned to the right of $EXTERNAL_MONITOR"
-        fi
-    else
-        DISPLAY="$TEST_DISPLAY" xrandr --output eDP-1 --auto 2>&1
-    fi
-    echo ""
-    echo "If Display Settings GUI cannot toggle displays but xrandr commands work,"
-    echo "this indicates a Display Settings tool issue (likely DBus/session related),"
-    echo "NOT an Xorg/RandR issue."
-    echo ""
-    echo "Possible causes:"
-    echo "  - xfconfd (XFCE settings daemon) not running (needed for Display Settings to apply changes)"
-    echo "  - Display Settings may require a full XFCE session context"
-    echo "  - Version mismatch between Display Settings and Xorg"
-else
-    echo "✗ FAILED: xrandr command failed (RandR issue)"
-fi
+echo "=== Note about XR Virtual Outputs ==="
+echo "XR-0, XR-1, etc. are virtual outputs that should display desktop content like regular displays."
+echo "However, they currently cannot be enabled via Display Settings because:"
+echo "  - Virtual outputs are created without CRTCs assigned"
+echo "  - In RandR, an output needs a CRTC to be 'active' and display content"
+echo "  - They appear as 'connected' but 'disabled' in Display Settings"
+echo ""
+echo "To enable them and display desktop content, they need CRTCs assigned."
+echo "This is a limitation in the current implementation that needs to be addressed."
+echo "The virtual outputs should be able to show desktop windows/content once CRTCs are assigned."
 echo ""
 echo "Waiting for Display Settings to be closed (this will exit the test session)..."
 if [ -n "$DISPLAY_SETTINGS_PID" ]; then
