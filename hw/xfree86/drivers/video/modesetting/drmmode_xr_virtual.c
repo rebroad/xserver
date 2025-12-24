@@ -318,9 +318,15 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
         return NULL;
     }
 
-    /* Set connection to connected so Display Settings can see it
-     * (even though it's virtual, we want it to appear as available) */
-    RROutputSetConnection(output->randr_output, RR_Connected);
+    /* Set connection based on AR mode state */
+    /* If AR mode is enabled, virtual outputs should be shown (connected)
+     * If AR mode is disabled, virtual outputs should be hidden (disconnected) */
+    if (ms->xr_ar_mode) {
+        RROutputSetConnection(output->randr_output, RR_Connected);
+    } else {
+        RROutputSetConnection(output->randr_output, RR_Disconnected);
+        output->status = XF86OutputStatusDisconnected;
+    }
 
     /* Set modes */
     drmmode_xr_virtual_set_modes(output, width, height, refresh);
@@ -587,7 +593,29 @@ drmmode_xr_manager_set_property(xf86OutputPtr output, Atom property,
     if (!prop_name)
         return FALSE;
 
-    /* Only handle our custom properties */
+    /* Handle AR_MODE property */
+    if (strcmp(prop_name, XR_AR_MODE_PROPERTY) == 0) {
+        INT32 ar_mode_value;
+        
+        if (value->type != XA_INTEGER || value->format != 32 || value->size != 1) {
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                       "AR_MODE property must be INTEGER format\n");
+            return FALSE;
+        }
+        
+        ar_mode_value = *(INT32 *)value->data;
+        if (drmmode_xr_set_ar_mode(pScrn, ar_mode_value != 0)) {
+            xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                       "AR mode %s\n", ar_mode_value ? "enabled" : "disabled");
+            return TRUE;
+        } else {
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                       "Failed to set AR mode\n");
+            return FALSE;
+        }
+    }
+
+    /* Only handle our other custom properties */
     if (strcmp(prop_name, XR_CREATE_OUTPUT_PROPERTY) != 0 &&
         strcmp(prop_name, XR_DELETE_OUTPUT_PROPERTY) != 0) {
         return FALSE; /* Let default handler deal with it */
@@ -977,16 +1005,139 @@ drmmode_xr_get_ar_mode(ScrnInfoPtr pScrn)
 /**
  * Set AR mode for virtual XR connectors
  */
+/**
+ * Check if an output is a physical XR display
+ * 
+ * For now, we check if the output is marked as non_desktop.
+ * TODO: we'll enhance this to check EDID vendor/product strings
+ * to detect XREAL/VITURE glasses specifically.
+ */
+static Bool
+drmmode_xr_is_physical_xr_output(xf86OutputPtr output)
+{
+    drmmode_output_private_ptr drmmode_output;
+    
+    if (!output || !output->driver_private)
+        return FALSE;
+    
+    drmmode_output = output->driver_private;
+    
+    /* Skip virtual outputs (they don't have DRM connector IDs) */
+    if (drmmode_output->output_id == 0 || drmmode_output->output_id == -1)
+        return FALSE;
+    
+    /* Skip XR-Manager output */
+    if (strcmp(output->name, XR_MANAGER_OUTPUT_NAME) == 0)
+        return FALSE;
+    
+    /* Skip virtual XR outputs (they start with "XR-") */
+    if (output->name && strncmp(output->name, "XR-", 3) == 0)
+        return FALSE;
+    
+    /* For now, check if marked as non_desktop (item #4 will enhance this with EDID detection) */
+    if (output->non_desktop)
+        return TRUE;
+    
+    /* TODO in item #4: Check EDID vendor/product strings for XREAL/VITURE */
+    
+    return FALSE;
+}
+
 Bool
 drmmode_xr_set_ar_mode(ScrnInfoPtr pScrn, Bool enabled)
 {
     modesettingPtr ms = modesettingPTR(pScrn);
+    xf86CrtcConfigPtr xf86_config = XF86_CRTC_CONFIG_PTR(pScrn);
+    xr_virtual_output_ptr vout;
+    ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
+    int i;
+    Bool changed = FALSE;
+
+    if (ms->xr_ar_mode == enabled) {
+        /* Already in requested state, nothing to do */
+        return TRUE;
+    }
+
     ms->xr_ar_mode = enabled;
 
-    /* TODO: Implement actual AR mode logic:
-     * - When enabled: hide physical XR connector, show virtual XR connector
-     * - When disabled: show physical XR connector, hide virtual XR connector
-     */
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "Setting AR mode to %s\n", enabled ? "enabled" : "disabled");
+
+    /* Iterate through all outputs and hide/show physical XR connectors */
+    for (i = 0; i < xf86_config->num_output; i++) {
+        xf86OutputPtr output = xf86_config->output[i];
+        
+        if (!output || !output->randr_output)
+            continue;
+        
+        /* Check if this is a physical XR output */
+        if (drmmode_xr_is_physical_xr_output(output)) {
+            if (enabled) {
+                /* AR mode enabled: hide physical XR connector */
+                if (output->randr_output->connection != RR_Disconnected) {
+                    RROutputSetConnection(output->randr_output, RR_Disconnected);
+                    output->status = XF86OutputStatusDisconnected;
+                    changed = TRUE;
+                    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                               "Hid physical XR output '%s' (AR mode enabled)\n",
+                               output->name);
+                }
+            } else {
+                /* AR mode disabled: show physical XR connector */
+                if (output->randr_output->connection != RR_Connected) {
+                    /* Restore connection status based on hardware state */
+                    if (output->funcs && output->funcs->detect) {
+                        output->status = (*output->funcs->detect)(output);
+                    } else {
+                        /* Fallback: assume connected if hardware output exists */
+                        output->status = XF86OutputStatusConnected;
+                    }
+                    if (output->status == XF86OutputStatusConnected) {
+                        RROutputSetConnection(output->randr_output, RR_Connected);
+                        changed = TRUE;
+                        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                                   "Showed physical XR output '%s' (AR mode disabled)\n",
+                                   output->name);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Show/hide virtual XR outputs */
+    vout = ms->xr_virtual_outputs;
+    while (vout) {
+        if (vout->output && vout->randr_output) {
+            if (enabled) {
+                /* AR mode enabled: show virtual XR connector */
+                if (vout->randr_output->connection != RR_Connected) {
+                    RROutputSetConnection(vout->randr_output, RR_Connected);
+                    vout->output->status = XF86OutputStatusConnected;
+                    changed = TRUE;
+                    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                               "Showed virtual XR output '%s' (AR mode enabled)\n",
+                               vout->name);
+                }
+            } else {
+                /* AR mode disabled: hide virtual XR connector */
+                if (vout->randr_output->connection != RR_Disconnected) {
+                    RROutputSetConnection(vout->randr_output, RR_Disconnected);
+                    vout->output->status = XF86OutputStatusDisconnected;
+                    changed = TRUE;
+                    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                               "Hid virtual XR output '%s' (AR mode disabled)\n",
+                               vout->name);
+                }
+            }
+        }
+        vout = vout->next;
+    }
+
+    /* Notify RandR if anything changed */
+    if (changed && pScreen) {
+        RRSetChanged(pScreen);
+        RRTellChanged(pScreen);
+    }
 
     return TRUE;
 }
