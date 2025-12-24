@@ -11,14 +11,27 @@ set -e
 
 # Parse command-line arguments
 USE_SYSTEM_XORG=0
+SESSION_TYPE="xfce4"
 if [ "$1" = "system" ]; then
     USE_SYSTEM_XORG=1
+    SESSION_TYPE="${2:-xfce4}"
     echo "Using system Xorg (for testing/comparison with VT7)"
+    shift
+elif [ "$1" = "gnome" ]; then
+    SESSION_TYPE="gnome"
+    shift
+elif [ "$1" = "xfce4" ]; then
+    SESSION_TYPE="xfce4"
+    shift
 elif [ -n "$1" ]; then
-    echo "Usage: $0 [system]"
+    echo "Usage: $0 [system|gnome|xfce4]"
     echo "  system: Use system Xorg instead of built Xorg"
+    echo "  gnome:  Start GNOME session instead of XFCE4"
+    echo "  xfce4:  Start XFCE4 session (default)"
     exit 1
 fi
+
+echo "Session type: $SESSION_TYPE"
 
 XSRC_DIR="/home/rebroad/src/xserver"
 BUILD_DIR="$XSRC_DIR/build"
@@ -1035,151 +1048,145 @@ else
 fi
 echo ""
 
-# Test 1: List all outputs
-echo "=== Test 1: List all outputs ==="
-echo "All outputs:"
+# Test workflow: Use breezy-desktop instead of direct xrandr commands
+echo "=== Test: Breezy Desktop Integration ==="
+echo ""
+echo "Testing workflow:"
+echo "1. Glasses connect → XRLinuxDriver detects device"
+echo "2. Initial calibration period (15 seconds for XREAL devices)"
+echo "3. Physical VR display marked as non-desktop via EDID"
+echo "4. Virtual XR connector (XR-0) appears in same screen location"
+echo "5. Breezy renderer captures from virtual buffer and converts to 3D for physical display"
+echo ""
+
+# Test 1: Check if XRLinuxDriver is running and active
+echo "=== Test 1: XRLinuxDriver Status ==="
+if systemctl --user is-active --quiet xr-driver 2>/dev/null; then
+    echo "✓ XRLinuxDriver service is active"
+else
+    echo "⚠ XRLinuxDriver service is not active"
+    echo "  Start it with: systemctl --user start xr-driver"
+fi
+echo ""
+
+# Test 2: Check if breezy-desktop is installed and available
+echo "=== Test 2: Breezy Desktop Availability ==="
+BREEZY_UI=""
+if command -v com.xronlinux.BreezyDesktop >/dev/null 2>&1; then
+    BREEZY_UI="com.xronlinux.BreezyDesktop"
+    echo "✓ Breezy Desktop found: $BREEZY_UI"
+elif [ -f "$HOME/.local/bin/breezy_desktop" ]; then
+    BREEZY_UI="$HOME/.local/bin/breezy_desktop"
+    echo "✓ Breezy Desktop found: $BREEZY_UI"
+else
+    echo "⚠ Breezy Desktop not found in PATH"
+    echo "  Make sure breezy-desktop is installed"
+fi
+echo ""
+
+# Test 3: List all outputs (before breezy-desktop starts)
+echo "=== Test 3: Initial Display Configuration ==="
+echo "All outputs before Breezy Desktop:"
 DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" || DISPLAY="$TEST_DISPLAY" xrandr 2>&1
 echo ""
 
-# Test 2: List all monitors
-echo "=== Test 2: List all monitors ==="
-DISPLAY="$TEST_DISPLAY" xrandr --listmonitors
+# Test 4: Start breezy-desktop and monitor changes
+echo "=== Test 4: Starting Breezy Desktop ==="
+echo "Waiting for glasses to connect (if not already connected)..."
+echo ""
+echo "Expected behavior:"
+echo "  1. When glasses first connect: calibration period begins"
+echo "  2. After calibration: physical VR display should be marked non-desktop"
+echo "  3. Virtual XR connector (XR-0) should appear in same location"
+echo "  4. Breezy renderer should start capturing and rendering to physical display"
+echo ""
+
+if [ -n "$BREEZY_UI" ]; then
+    echo "Launching Breezy Desktop UI..."
+    DISPLAY="$TEST_DISPLAY" "$BREEZY_UI" >/tmp/breezy_desktop_${TEST_DISPLAY#:}.log 2>&1 &
+    BREEZY_PID=$!
+    sleep 3
+    
+    if kill -0 $BREEZY_PID 2>/dev/null; then
+        echo "✓ Breezy Desktop launched (PID: $BREEZY_PID)"
+        echo ""
+        echo "Monitoring display changes (checking every 2 seconds for 30 seconds)..."
+        
+        # Monitor for display changes
+        for i in {1..15}; do
+            sleep 2
+            echo ""
+            echo "[$((i*2))s] Current outputs:"
+            DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
+            
+            # Check for physical VR display marked as non-desktop
+            if DISPLAY="$TEST_DISPLAY" xrandr --listmonitors 2>/dev/null | grep -q "non-desktop"; then
+                echo "  ✓ Physical VR display detected as non-desktop"
+            fi
+            
+            # Check for virtual XR connector
+            if DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -qE "^XR-0"; then
+                echo "  ✓ Virtual XR connector (XR-0) detected"
+            fi
+        done
+    else
+        echo "⚠ Breezy Desktop exited immediately (check /tmp/breezy_desktop_${TEST_DISPLAY#:}.log)"
+        BREEZY_PID=""
+    fi
+else
+    echo "⚠ Cannot start Breezy Desktop - not found"
+    echo "  Install it first, then rerun this test"
+fi
 echo ""
 
 # XR-specific tests (only for custom-built Xorg with XR support)
 if [ $USE_SYSTEM_XORG -eq 0 ]; then
-    # Test 3: Check if XR-Manager appears in xrandr
-    echo "=== Test 3: Check if XR-Manager appears in xrandr ==="
+    echo "=== Test 5: XR Connector Status ==="
     if DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -q "^XR-Manager"; then
         echo "✓ XR-Manager found in xrandr output"
     else
-        echo "✗ XR-Manager not found (this is expected if XR support is not enabled)"
+        echo "⚠ XR-Manager not found (virtual XR connector support may not be enabled yet)"
     fi
-    echo ""
-
-    # Test 4: Automated XR Output Tests
-    echo "=== Test 4: Automated XR Output Tests ==="
-    echo "Waiting a moment for Display Settings to fully open..."
-    sleep 2
-
-    echo ""
-    echo "Creating virtual XR outputs..."
-    echo "  Creating XR-0 (1920x1080@60Hz)..."
-    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-0:1920:1080:60" 2>&1; then
-        echo "  ✓ XR-0 created"
-        sleep 2
+    
+    if DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -qE "^XR-0"; then
+        echo "✓ XR-0 virtual connector is present"
     else
-        echo "  ✗ Failed to create XR-0"
+        echo "⚠ XR-0 virtual connector not found"
     fi
-
-    echo "  Creating XR-1 (2560x1440@60Hz)..."
-    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set CREATE_XR_OUTPUT "XR-1:2560:1440:60" 2>&1; then
-        echo "  ✓ XR-1 created"
-        sleep 2
-    else
-        echo "  ✗ Failed to create XR-1"
-    fi
-
-    # Enable the created XR outputs so they show as active (blue) in Display Settings
-    echo ""
-    echo "Enabling XR outputs so they appear active in Display Settings..."
-    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --auto 2>&1; then
-        echo "  ✓ XR-0 enabled"
-    fi
-    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-1 --auto 2>&1; then
-        echo "  ✓ XR-1 enabled"
-    fi
-    sleep 1
-
-    echo ""
-    echo "Current outputs:"
-    DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
-
-    echo ""
-    echo "XR outputs created. Please verify they appear in Display Settings before we proceed with resizing and deletion tests."
-    echo "Note: Outputs are created as 'connected' so they should be visible in Display Settings."
-    if command -v zenity >/dev/null 2>&1; then
-        DISPLAY="$TEST_DISPLAY" zenity --info --title "XR Output Test" \
-            --text "XR-0 and XR-1 have been created.\n\nPlease check Display Settings to verify they appear.\n\nClick OK when ready to proceed with resizing and deletion tests." \
-            2>/dev/null || echo "  (zenity dialog closed or failed)"
-    elif command -v xmessage >/dev/null 2>&1; then
-        DISPLAY="$TEST_DISPLAY" xmessage -center -timeout 0 \
-            "XR-0 and XR-1 have been created. Please check Display Settings to verify they appear. Click OK when ready to proceed with resizing and deletion tests." \
-            2>/dev/null || echo "  (xmessage dialog closed)"
-    else
-        echo "  Press Enter when ready to proceed with resizing and deletion tests..."
-        read -r
-    fi
-
-    echo ""
-    echo "Resizing XR-0 to 3840x2160..."
-    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_WIDTH 3840 2>&1 && \
-       DISPLAY="$TEST_DISPLAY" xrandr --output XR-0 --set XR_HEIGHT 2160 2>&1; then
-        echo "  ✓ XR-0 resized"
-        sleep 2
-    else
-        echo "  ✗ Failed to resize XR-0"
-    fi
-
-    echo ""
-    echo "Deleting XR-1..."
-    # Suppress stderr since we expect a BadRROutput error (xrandr queries before deletion completes)
-    if DISPLAY="$TEST_DISPLAY" xrandr --output XR-Manager --set DELETE_XR_OUTPUT "XR-1" 2>/dev/null; then
-        echo "  ✓ XR-1 deleted"
-    else
-        # The deletion actually succeeds, but xrandr reports an error because it queries the output
-        # during the property change operation, before the deletion completes
-        echo "  ✓ XR-1 deleted (xrandr reported an error, but deletion succeeded - see final outputs below)"
-    fi
-    # Wait a moment for RandR changes to propagate
-    sleep 1
-
-    echo ""
-    echo "Final outputs:"
-    DISPLAY="$TEST_DISPLAY" xrandr 2>&1 | grep -E "^[A-Z]" | head -10
-else
-    echo "=== XR Tests Skipped (using system Xorg) ==="
-    echo "XR-specific tests are only available with custom-built Xorg that includes XR support."
     echo ""
 fi
 
 echo ""
 echo "=== Interactive Testing ==="
 echo "Xorg is running on display $TEST_DISPLAY (VT $TEST_VT)"
-if [ -n "$XFWM4_PID" ]; then
-    echo "Window manager (xfwm4/openbox) is running (PID: $XFWM4_PID)"
-else
-    echo "Window manager: not running"
-fi
-echo "Display Settings should be open - you can see the RandR outputs visually"
-echo ""
-echo "=== Note about XR Virtual Outputs ==="
-echo "XR-0, XR-1, etc. are virtual outputs that should display desktop content like regular displays."
-echo "However, they currently cannot be enabled via Display Settings because:"
-echo "  - Virtual outputs are created without CRTCs assigned"
-echo "  - In RandR, an output needs a CRTC to be 'active' and display content"
-echo "  - They appear as 'connected' but 'disabled' in Display Settings"
-echo ""
-echo "To enable them and display desktop content, they need CRTCs assigned."
-echo "This is a limitation in the current implementation that needs to be addressed."
-echo "The virtual outputs should be able to show desktop windows/content once CRTCs are assigned."
-echo ""
-echo "Waiting for Display Settings to be closed (this will exit the test session)..."
-if [ -n "$DISPLAY_SETTINGS_PID" ]; then
-    # Check if Xorg is still running
-    if ! kill -0 $XORG_PID 2>/dev/null; then
-        echo "WARNING: Xorg process ($XORG_PID) is not running - server may have crashed"
-        echo "Check Xorg log: $TEST_LOG"
-        echo "Display Settings may still be running, but X server is gone"
-        echo "Proceeding to cleanup..."
+echo "Session type: $SESSION_TYPE"
+if [ -n "$WM_PID" ]; then
+    if [ "$SESSION_TYPE" = "gnome" ]; then
+        echo "GNOME session is running (PID: $WM_PID)"
     else
-        wait $DISPLAY_SETTINGS_PID 2>/dev/null || true
-        echo "Display Settings closed - proceeding to cleanup..."
+        echo "Window manager is running (PID: $WM_PID)"
     fi
 else
-    echo "Display Settings was not running - press Enter to exit..."
-    read -r
+    echo "Window manager/desktop session: not running"
 fi
+if [ -n "$BREEZY_PID" ]; then
+    echo "Breezy Desktop is running (PID: $BREEZY_PID)"
+fi
+echo ""
+echo "=== Expected Workflow ==="
+echo "1. Glasses connect → XRLinuxDriver detects device"
+echo "2. Initial calibration period (15 seconds for XREAL devices)"
+echo "3. Physical VR display marked as non-desktop via EDID (hidden from Display Settings)"
+echo "4. Virtual XR connector (XR-0) appears in same screen location"
+echo "5. XFCE4/GNOME compositor renders to virtual XR connector (off-screen buffer)"
+echo "6. Breezy renderer captures from virtual buffer via DRM/KMS"
+echo "7. Renderer applies 3D transformations (IMU head tracking) via GLSL shaders"
+echo "8. Renderer outputs directly to physical AR glasses display"
+echo ""
+echo "Monitor the outputs above to verify this workflow is working correctly."
+echo ""
+echo "Press Enter to exit the test session..."
+read -r
 
 echo ""
 echo "=== Cleanup ==="
@@ -1214,13 +1221,23 @@ if [ -n "${DBUS_SESSION_BUS_PID:-}" ] && kill -0 $DBUS_SESSION_BUS_PID 2>/dev/nu
     fi
 fi
 
-# Kill window manager if still running
-if [ -n "$XFWM4_PID" ] && kill -0 $XFWM4_PID 2>/dev/null; then
-    echo "Stopping window manager..."
-    kill $XFWM4_PID 2>/dev/null || true
+# Kill Breezy Desktop if still running
+if [ -n "$BREEZY_PID" ] && kill -0 $BREEZY_PID 2>/dev/null; then
+    echo "Stopping Breezy Desktop..."
+    kill $BREEZY_PID 2>/dev/null || true
     sleep 0.5
-    if kill -0 $XFWM4_PID 2>/dev/null; then
-        kill -9 $XFWM4_PID 2>/dev/null || true
+    if kill -0 $BREEZY_PID 2>/dev/null; then
+        kill -9 $BREEZY_PID 2>/dev/null || true
+    fi
+fi
+
+# Kill window manager if still running
+if [ -n "$WM_PID" ] && kill -0 $WM_PID 2>/dev/null; then
+    echo "Stopping window manager..."
+    kill $WM_PID 2>/dev/null || true
+    sleep 0.5
+    if kill -0 $WM_PID 2>/dev/null; then
+        kill -9 $WM_PID 2>/dev/null || true
     fi
 fi
 
