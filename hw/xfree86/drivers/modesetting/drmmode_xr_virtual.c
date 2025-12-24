@@ -28,6 +28,7 @@
 #include <xf86drm.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include "xf86.h"
 #include "xf86str.h"
 #include "xf86Crtc.h"
@@ -48,11 +49,7 @@ extern void drmmode_output_create_resources(xf86OutputPtr output);
 extern const xf86OutputFuncsRec drmmode_output_funcs;
 extern const xf86CrtcFuncsRec drmmode_crtc_funcs;
 
-/* Forward declarations for functions we need */
-extern int drmmode_bo_import(drmmode_ptr drmmode, drmmode_bo *bo, uint32_t *fb_id);
-extern int drmmode_bo_destroy(drmmode_ptr drmmode, drmmode_bo *bo);
-extern uint32_t drmmode_bo_get_pitch(drmmode_bo *bo);
-extern uint32_t drmmode_bo_get_handle(drmmode_bo *bo);
+/* Functions we need are declared in drmmode_display.h */
 
 #define XR_MANAGER_OUTPUT_NAME "XR-Manager"
 #define XR_AR_MODE_PROPERTY "AR_MODE"
@@ -75,6 +72,14 @@ typedef struct _xr_virtual_output_rec {
     PixmapPtr pixmap;              /* X11 pixmap backed by framebuffer (for compositor) */
     struct _xr_virtual_output_rec *next;  /* Linked list */
 } xr_virtual_output_rec, *xr_virtual_output_ptr;
+
+/* Forward declarations for static functions - defined after typedefs */
+static xf86CrtcPtr drmmode_xr_create_virtual_crtc(ScrnInfoPtr pScrn, drmmode_ptr drmmode);
+static Bool drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
+                                                     xr_virtual_output_ptr vout,
+                                                     int width, int height);
+static void drmmode_xr_destroy_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
+                                                      xr_virtual_output_ptr vout);
 
 /* Get property atoms - use macros to avoid function call overhead */
 #define XR_AR_MODE_ATOM() MakeAtom(XR_AR_MODE_PROPERTY, strlen(XR_AR_MODE_PROPERTY), TRUE)
@@ -363,7 +368,6 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     }
 
     /* Create RandR CRTC for this virtual CRTC if screen is initialized */
-    ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
     if (pScreen && pScreen->root) {
         RRCrtcPtr randr_crtc = RRCrtcCreate(pScreen, crtc);
         if (randr_crtc) {
@@ -458,8 +462,17 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
     else
         ms->xr_virtual_outputs = vout->next;
 
-    /* Destroy off-screen framebuffer first */
-    drmmode_xr_destroy_offscreen_framebuffer(pScrn, drmmode, vout);
+    /* Get drmmode from output */
+    drmmode_ptr drmmode = NULL;
+    if (vout->output && vout->output->driver_private) {
+        drmmode_output_private_ptr drmmode_output = vout->output->driver_private;
+        drmmode = drmmode_output->drmmode;
+    }
+    
+    if (drmmode) {
+        /* Destroy off-screen framebuffer first */
+        drmmode_xr_destroy_offscreen_framebuffer(pScrn, drmmode, vout);
+    }
 
     /* Clean up CRTC if assigned */
     if (vout->output && vout->output->crtc) {
@@ -1007,7 +1020,6 @@ drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     msPixmapPrivPtr ppriv;
     void *pixmap_ptr = NULL;
     int ret;
-    int cpp = (pScrn->bitsPerPixel + 7) / 8;
     int pitch;
     
     /* Initialize framebuffer BO structure */
@@ -1048,14 +1060,27 @@ drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
         
         if (vout->framebuffer_bo.gbm) {
             /* GBM BO created successfully - we'll use this instead of dumb buffer */
+            xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                       "Created GBM buffer object for off-screen framebuffer '%s' (GPU-optimized)\n",
+                       vout->name);
             goto bo_created;
         }
         
         /* GBM creation failed, fall through to dumb buffer */
         xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                   "Failed to create GBM BO for '%s', falling back to dumb buffer\n",
+                   "Failed to create GBM BO for '%s', falling back to dumb buffer (CPU-accessible, less efficient)\n",
+                   vout->name);
+    } else {
+        /* GBM not available - log fallback to dumb buffer */
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                   "GBM not available for '%s', using dumb buffer (CPU-accessible)\n",
                    vout->name);
     }
+#else
+    /* GBM support not compiled in - log that we're using dumb buffer */
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "GBM support not compiled in for '%s', using dumb buffer (CPU-accessible)\n",
+               vout->name);
 #endif
 
     /* Fallback to dumb buffer (works on all systems, CPU-accessible) */
@@ -1126,23 +1151,40 @@ bo_created:
         
         /* Create EGL texture from GBM BO */
         if (!ms->glamor.egl_create_textured_pixmap_from_gbm_bo(pixmap, vout->framebuffer_bo.gbm, FALSE)) {
-            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
-                       "Failed to create EGL texture from GBM BO for '%s'\n",
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                       "Failed to create EGL texture from GBM BO for '%s', falling back to CPU path\n",
                        vout->name);
             (*pScreen->DestroyPixmap)(pixmap);
-            drmModeRmFB(drmmode->fd, vout->framebuffer_id);
-            drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
-            return FALSE;
+            /* Fall through to dumb buffer path */
+        } else {
+            /* Successfully created EGL texture from GBM BO */
+            xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                       "Created EGL texture from GBM BO for '%s' (GPU-optimized pixmap)\n",
+                       vout->name);
+            
+            /* Set up pixmap private data to track the BO */
+            ppriv = msGetPixmapPriv(drmmode, pixmap);
+            if (ppriv) {
+                ppriv->fb_id = vout->framebuffer_id;
+                /* For GBM BOs, backing_bo is NULL - glamor handles it via EGL */
+                ppriv->backing_bo = NULL;
+            }
+            vout->pixmap = pixmap;
+            goto pixmap_created;
         }
-        
-        /* Set up pixmap private data to track the BO */
-        ppriv = msGetPixmapPriv(drmmode, pixmap);
-        if (ppriv) {
-            ppriv->fb_id = vout->framebuffer_id;
-            /* For GBM BOs, backing_bo is NULL - glamor handles it via EGL */
-            ppriv->backing_bo = NULL;
-        }
-    } else
+    }
+    
+    /* If we reach here, either:
+     * 1. GBM BO creation failed earlier (already logged)
+     * 2. GBM is not available (already logged)
+     * 3. EGL texture creation from GBM BO failed (just logged)
+     * In all cases, fall through to dumb buffer path */
+    if (vout->framebuffer_bo.gbm) {
+        /* We have a GBM BO but couldn't create EGL texture - this is unusual */
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "Using CPU-mappable fallback path for GBM BO '%s' (less efficient)\n",
+                   vout->name);
+    }
 #endif
     {
         /* Dumb buffer path - use CPU-accessible memory */
@@ -1185,6 +1227,7 @@ bo_created:
         }
     }
 
+pixmap_created:
     vout->pixmap = pixmap;
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
@@ -1202,7 +1245,6 @@ drmmode_xr_destroy_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
                                          xr_virtual_output_ptr vout)
 {
     ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
-    modesettingPtr ms = modesettingPTR(pScrn);
 
     if (!vout)
         return;
@@ -1255,8 +1297,7 @@ drmmode_xr_virtual_crtc_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
 }
 
 static void
-drmmode_xr_virtual_crtc_set_cursor_colors(xf86CrtcPtr crtc,
-                                          uint16_t red, uint16_t green, uint16_t blue)
+drmmode_xr_virtual_crtc_set_cursor_colors(xf86CrtcPtr crtc, int bg, int fg)
 {
     /* Virtual CRTCs don't support hardware cursors */
 }
@@ -1315,7 +1356,8 @@ drmmode_xr_virtual_crtc_set_scanout_pixmap(xf86CrtcPtr crtc, PixmapPtr ppix)
 {
     /* For virtual CRTCs, we'll track the scanout pixmap but not program hardware */
     /* This will be used later to create DRM framebuffers for capture */
-    drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+    (void)crtc;  /* unused */
+    (void)ppix;  /* unused */
     
     /* Store reference to scanout pixmap for framebuffer export */
     /* TODO: Create DRM framebuffer from pixmap for capture by renderer */
@@ -1323,21 +1365,22 @@ drmmode_xr_virtual_crtc_set_scanout_pixmap(xf86CrtcPtr crtc, PixmapPtr ppix)
     return TRUE;
 }
 
-static Bool
-drmmode_xr_virtual_crtc_shadow_allocate(xf86CrtcPtr crtc)
+static void *
+drmmode_xr_virtual_crtc_shadow_allocate(xf86CrtcPtr crtc, int width, int height)
 {
     /* Virtual CRTCs use software framebuffers, shadow allocation not needed */
-    return TRUE;
+    return NULL;
 }
 
-static void
-drmmode_xr_virtual_crtc_shadow_create(xf86CrtcPtr crtc)
+static PixmapPtr
+drmmode_xr_virtual_crtc_shadow_create(xf86CrtcPtr crtc, void *data, int width, int height)
 {
     /* Virtual CRTCs use software framebuffers, shadow not needed */
+    return NULL;
 }
 
 static void
-drmmode_xr_virtual_crtc_shadow_destroy(xf86CrtcPtr crtc)
+drmmode_xr_virtual_crtc_shadow_destroy(xf86CrtcPtr crtc, PixmapPtr pPixmap, void *data)
 {
     /* Virtual CRTCs use software framebuffers, shadow not needed */
 }
@@ -1368,7 +1411,7 @@ drmmode_xr_create_virtual_crtc(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
 {
     xf86CrtcPtr crtc;
     drmmode_crtc_private_ptr drmmode_crtc;
-    modesettingPtr ms = modesettingPTR(pScrn);
+    (void)drmmode;  /* unused for now */
 
     /* Create the CRTC using virtual function table */
     crtc = xf86CrtcCreate(pScrn, &drmmode_xr_virtual_crtc_funcs);
