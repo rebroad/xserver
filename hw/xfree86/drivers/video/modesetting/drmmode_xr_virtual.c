@@ -37,6 +37,11 @@
 #include "xf86DDC.h"
 #include "drmmode_display.h"
 #include "driver.h"
+#ifdef GLAMOR_HAS_GBM
+#define GLAMOR_FOR_XORG 1
+#include "glamor.h"
+#include <gbm.h>
+#endif
 
 /* Forward declarations - these functions/objects are in drmmode_display.c */
 extern void drmmode_output_create_resources(xf86OutputPtr output);
@@ -1011,12 +1016,49 @@ drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     vout->pixmap = NULL;
 
     /* Create DRM buffer object (BO) - this allocates memory for the framebuffer */
-    /* We need to call drmmode_create_bo, but it's static, so we'll use a helper */
-    /* Actually, we can create it via dumb_bo_create directly for now */
+    /* We replicate the logic from drmmode_create_bo() to support both GBM and dumb buffers */
     vout->framebuffer_bo.width = width;
     vout->framebuffer_bo.height = height;
     
-    /* Create dumb buffer (works on all systems, no GPU required) */
+#ifdef GLAMOR_HAS_GBM
+    /* Try GBM first if available (GPU-optimized, better performance) */
+    if (drmmode->glamor && drmmode->gbm) {
+        uint32_t format;
+        
+        /* Select GBM format based on screen depth (same logic as drmmode_create_bo) */
+        switch (pScrn->depth) {
+        case 15:
+            format = GBM_FORMAT_ARGB1555;
+            break;
+        case 16:
+            format = GBM_FORMAT_RGB565;
+            break;
+        case 30:
+            format = GBM_FORMAT_ARGB2101010;
+            break;
+        default:
+            format = GBM_FORMAT_ARGB8888;
+            break;
+        }
+        
+        /* Create GBM buffer object with scanout and rendering flags */
+        vout->framebuffer_bo.gbm = gbm_bo_create(drmmode->gbm, width, height, format,
+                                                GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT);
+        vout->framebuffer_bo.used_modifiers = FALSE;
+        
+        if (vout->framebuffer_bo.gbm) {
+            /* GBM BO created successfully - we'll use this instead of dumb buffer */
+            goto bo_created;
+        }
+        
+        /* GBM creation failed, fall through to dumb buffer */
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "Failed to create GBM BO for '%s', falling back to dumb buffer\n",
+                   vout->name);
+    }
+#endif
+
+    /* Fallback to dumb buffer (works on all systems, CPU-accessible) */
     vout->framebuffer_bo.dumb = dumb_bo_create(drmmode->fd, width, height,
                                                drmmode->kbpp);
     if (!vout->framebuffer_bo.dumb) {
@@ -1025,6 +1067,8 @@ drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
                    vout->name);
         return FALSE;
     }
+
+bo_created:
 
     /* Import BO as DRM framebuffer (get FB ID for capture) */
     ret = drmmode_bo_import(drmmode, &vout->framebuffer_bo,
@@ -1040,16 +1084,20 @@ drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     /* Get pitch for pixmap creation */
     pitch = drmmode_bo_get_pitch(&vout->framebuffer_bo);
 
-    /* Map the BO to CPU-accessible memory */
+    /* Map the BO to CPU-accessible memory (or prepare for GPU access) */
 #ifdef GLAMOR_HAS_GBM
-    if (drmmode->glamor && drmmode->gbm && vout->framebuffer_bo.gbm) {
-        /* GBM BO - map via gbm_bo_map if needed */
-        /* For now, we'll create a pixmap that references it differently */
-        pixmap_ptr = NULL; /* Glamor handles this differently */
+    if (vout->framebuffer_bo.gbm) {
+        /* GBM BO - cannot be CPU-mapped directly, but glamor can use it */
+        /* For GBM BOs, we don't set pixmap_ptr - glamor will handle it via EGL */
+        pixmap_ptr = NULL;
+        
+        /* Note: GBM BOs are GPU-optimized and may not be CPU-mappable.
+         * The compositor will render via OpenGL/EGL, and the renderer will
+         * capture via DMA-BUF export (which we'll implement in item #6). */
     } else
 #endif
     {
-        /* Dumb buffer - map it */
+        /* Dumb buffer - map it to CPU-accessible memory */
         ret = dumb_bo_map(drmmode->fd, vout->framebuffer_bo.dumb);
         if (ret != 0) {
             xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
@@ -1063,43 +1111,78 @@ drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     }
 
     /* Create X11 pixmap backed by the framebuffer BO */
-    /* We use CreatePixmap and ModifyPixmapHeader to set up the pixmap */
-    pixmap = (*pScreen->CreatePixmap)(pScreen, 0, 0, pScrn->depth, 0);
-    if (!pixmap) {
-        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
-                   "Failed to create pixmap for off-screen framebuffer '%s'\n",
-                   vout->name);
-        if (pixmap_ptr && vout->framebuffer_bo.dumb) {
-            munmap(vout->framebuffer_bo.dumb->ptr, vout->framebuffer_bo.dumb->size);
-            vout->framebuffer_bo.dumb->ptr = NULL;
+#ifdef GLAMOR_HAS_GBM
+    if (vout->framebuffer_bo.gbm && ms->glamor.egl_create_textured_pixmap_from_gbm_bo) {
+        /* For GBM BOs, use glamor's EGL texture creation (GPU-optimized path) */
+        pixmap = (*pScreen->CreatePixmap)(pScreen, width, height, pScrn->depth, 0);
+        if (!pixmap) {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "Failed to create pixmap for GBM off-screen framebuffer '%s'\n",
+                       vout->name);
+            drmModeRmFB(drmmode->fd, vout->framebuffer_id);
+            drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
+            return FALSE;
         }
-        drmModeRmFB(drmmode->fd, vout->framebuffer_id);
-        drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
-        return FALSE;
-    }
-
-    /* Modify pixmap header to use our framebuffer memory */
-    if (!(*pScreen->ModifyPixmapHeader)(pixmap, width, height,
-                                        pScrn->depth, pScrn->bitsPerPixel,
-                                        pitch, pixmap_ptr)) {
-        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
-                   "Failed to modify pixmap header for off-screen framebuffer '%s'\n",
-                   vout->name);
-        (*pScreen->DestroyPixmap)(pixmap);
-        if (pixmap_ptr && vout->framebuffer_bo.dumb) {
-            munmap(vout->framebuffer_bo.dumb->ptr, vout->framebuffer_bo.dumb->size);
-            vout->framebuffer_bo.dumb->ptr = NULL;
+        
+        /* Create EGL texture from GBM BO */
+        if (!ms->glamor.egl_create_textured_pixmap_from_gbm_bo(pixmap, vout->framebuffer_bo.gbm, FALSE)) {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "Failed to create EGL texture from GBM BO for '%s'\n",
+                       vout->name);
+            (*pScreen->DestroyPixmap)(pixmap);
+            drmModeRmFB(drmmode->fd, vout->framebuffer_id);
+            drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
+            return FALSE;
         }
-        drmModeRmFB(drmmode->fd, vout->framebuffer_id);
-        drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
-        return FALSE;
-    }
+        
+        /* Set up pixmap private data to track the BO */
+        ppriv = msGetPixmapPriv(drmmode, pixmap);
+        if (ppriv) {
+            ppriv->fb_id = vout->framebuffer_id;
+            /* For GBM BOs, backing_bo is NULL - glamor handles it via EGL */
+            ppriv->backing_bo = NULL;
+        }
+    } else
+#endif
+    {
+        /* Dumb buffer path - use CPU-accessible memory */
+        pixmap = (*pScreen->CreatePixmap)(pScreen, 0, 0, pScrn->depth, 0);
+        if (!pixmap) {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "Failed to create pixmap for off-screen framebuffer '%s'\n",
+                       vout->name);
+            if (pixmap_ptr && vout->framebuffer_bo.dumb) {
+                munmap(vout->framebuffer_bo.dumb->ptr, vout->framebuffer_bo.dumb->size);
+                vout->framebuffer_bo.dumb->ptr = NULL;
+            }
+            drmModeRmFB(drmmode->fd, vout->framebuffer_id);
+            drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
+            return FALSE;
+        }
 
-    /* Set up pixmap private data to track the BO */
-    ppriv = msGetPixmapPriv(drmmode, pixmap);
-    if (ppriv) {
-        ppriv->fb_id = vout->framebuffer_id;
-        ppriv->backing_bo = vout->framebuffer_bo.dumb;
+        /* Modify pixmap header to use our framebuffer memory */
+        if (!(*pScreen->ModifyPixmapHeader)(pixmap, width, height,
+                                            pScrn->depth, pScrn->bitsPerPixel,
+                                            pitch, pixmap_ptr)) {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "Failed to modify pixmap header for off-screen framebuffer '%s'\n",
+                       vout->name);
+            (*pScreen->DestroyPixmap)(pixmap);
+            if (pixmap_ptr && vout->framebuffer_bo.dumb) {
+                munmap(vout->framebuffer_bo.dumb->ptr, vout->framebuffer_bo.dumb->size);
+                vout->framebuffer_bo.dumb->ptr = NULL;
+            }
+            drmModeRmFB(drmmode->fd, vout->framebuffer_id);
+            drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
+            return FALSE;
+        }
+
+        /* Set up pixmap private data to track the BO */
+        ppriv = msGetPixmapPriv(drmmode, pixmap);
+        if (ppriv) {
+            ppriv->fb_id = vout->framebuffer_id;
+            ppriv->backing_bo = vout->framebuffer_bo.dumb;
+        }
     }
 
     vout->pixmap = pixmap;
