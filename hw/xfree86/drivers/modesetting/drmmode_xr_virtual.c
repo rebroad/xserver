@@ -41,6 +41,13 @@
 /* Forward declarations - these functions/objects are in drmmode_display.c */
 extern void drmmode_output_create_resources(xf86OutputPtr output);
 extern const xf86OutputFuncsRec drmmode_output_funcs;
+extern const xf86CrtcFuncsRec drmmode_crtc_funcs;
+
+/* Forward declarations for functions we need */
+extern int drmmode_bo_import(drmmode_ptr drmmode, drmmode_bo *bo, uint32_t *fb_id);
+extern int drmmode_bo_destroy(drmmode_ptr drmmode, drmmode_bo *bo);
+extern uint32_t drmmode_bo_get_pitch(drmmode_bo *bo);
+extern uint32_t drmmode_bo_get_handle(drmmode_bo *bo);
 
 #define XR_MANAGER_OUTPUT_NAME "XR-Manager"
 #define XR_AR_MODE_PROPERTY "AR_MODE"
@@ -58,6 +65,9 @@ typedef struct _xr_virtual_output_rec {
     int width;                     /* Current width */
     int height;                    /* Current height */
     int refresh;                   /* Current refresh rate */
+    drmmode_bo framebuffer_bo;     /* Off-screen DRM buffer object for rendering */
+    uint32_t framebuffer_id;       /* DRM framebuffer ID (for capture by renderer) */
+    PixmapPtr pixmap;              /* X11 pixmap backed by framebuffer (for compositor) */
     struct _xr_virtual_output_rec *next;  /* Linked list */
 } xr_virtual_output_rec, *xr_virtual_output_ptr;
 
@@ -338,9 +348,43 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     RROutputChanged(output->randr_output, TRUE);
     RRTellChanged(pScreen);
 
+    /* Create and assign a virtual CRTC for this output */
+    xf86CrtcPtr crtc = drmmode_xr_create_virtual_crtc(pScrn, drmmode);
+    if (!crtc) {
+        RROutputDestroy(output->randr_output);
+        free(drmmode_output);
+        xf86OutputDestroy(output);
+        return NULL;
+    }
+
+    /* Create RandR CRTC for this virtual CRTC if screen is initialized */
+    ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
+    if (pScreen && pScreen->root) {
+        RRCrtcPtr randr_crtc = RRCrtcCreate(pScreen, crtc);
+        if (randr_crtc) {
+            crtc->randr_crtc = randr_crtc;
+            /* Link output to CRTC */
+            if (!RROutputSetCrtcs(output->randr_output, &randr_crtc, 1)) {
+                xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                           "Failed to set CRTCs for virtual output '%s'\n", name);
+            }
+            /* Set output properties for CRTC assignment */
+            output->possible_crtcs = 1 << (randr_crtc->id);
+            output->possible_clones = 0;
+        } else {
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                       "Failed to create RandR CRTC for virtual output '%s'\n", name);
+        }
+    }
+
+    /* Assign CRTC to output (for XF86 layer) */
+    output->crtc = crtc;
+    drmmode_output->current_crtc = crtc;
+
     /* Allocate and initialize virtual output record */
     vout = calloc(1, sizeof(xr_virtual_output_rec));
     if (!vout) {
+        xf86CrtcDestroy(crtc);
         RROutputDestroy(output->randr_output);
         free(drmmode_output);
         xf86OutputDestroy(output);
@@ -353,13 +397,27 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     vout->width = width;
     vout->height = height;
     vout->refresh = refresh;
+    
+    /* Initialize framebuffer fields */
+    memset(&vout->framebuffer_bo, 0, sizeof(vout->framebuffer_bo));
+    vout->framebuffer_id = 0;
+    vout->pixmap = NULL;
+
+    /* Create off-screen framebuffer for this virtual output */
+    if (!drmmode_xr_create_offscreen_framebuffer(pScrn, drmmode, vout,
+                                                 width, height)) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "Failed to create off-screen framebuffer for '%s', continuing anyway\n",
+                   name);
+        /* Continue anyway - framebuffer creation failure is not fatal */
+    }
 
     /* Add to list */
     vout->next = ms->xr_virtual_outputs;
     ms->xr_virtual_outputs = vout;
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Created virtual XR output '%s' (%dx%d@%dHz)\n",
+               "Created virtual XR output '%s' (%dx%d@%dHz) with virtual CRTC and off-screen framebuffer\n",
                name, width, height, refresh);
 
     return vout;
@@ -395,25 +453,33 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
     else
         ms->xr_virtual_outputs = vout->next;
 
-    /* Disconnect output from any CRTC first (both xf86 and RandR) */
+    /* Destroy off-screen framebuffer first */
+    drmmode_xr_destroy_offscreen_framebuffer(pScrn, drmmode, vout);
+
+    /* Clean up CRTC if assigned */
     if (vout->output && vout->output->crtc) {
+        xf86CrtcPtr crtc = vout->output->crtc;
+        /* Destroy RandR CRTC if it exists */
+        if (crtc->randr_crtc) {
+            RRCrtcDestroy(crtc->randr_crtc);
+            crtc->randr_crtc = NULL;
+        }
+        /* Destroy XF86 CRTC */
+        xf86CrtcDestroy(crtc);
         vout->output->crtc = NULL;
     }
 
     /* Destroy RandR output first (before xf86Output) */
     if (vout->randr_output) {
-        /* Disconnect from RandR CRTC if connected */
-        if (vout->randr_output->crtc) {
-            vout->randr_output->crtc = NULL;
-        }
         /* Mark as disconnected before destroying */
         RROutputSetConnection(vout->randr_output, RR_Disconnected);
+        RROutputChanged(vout->randr_output, TRUE);
+        RRTellChanged(xf86ScrnToScreen(pScrn));
         /* Clear the pointer in xf86Output before destroying */
         if (vout->output)
             vout->output->randr_output = NULL;
         RROutputDestroy(vout->randr_output);
         vout->randr_output = NULL;
-        RRTellChanged(xf86ScrnToScreen(pScrn));
     }
 
     /* Destroy xf86Output - the destroy function will handle freeing driver_private */
@@ -905,4 +971,362 @@ drmmode_xr_set_ar_mode(ScrnInfoPtr pScrn, Bool enabled)
      */
 
     return TRUE;
+}
+
+/* ============================================================
+ * Off-screen Framebuffer Implementation
+ * ============================================================ */
+
+/**
+ * Create an off-screen framebuffer for a virtual XR output
+ * 
+ * "Off-screen" means this framebuffer is not connected to any physical display.
+ * The compositor renders to it as if it were a display, but instead of being
+ * sent to hardware, our 3D renderer captures it and applies transformations.
+ * 
+ * This function:
+ * 1. Creates a DRM buffer object (BO) in GPU or system memory
+ * 2. Imports it as a DRM framebuffer (gets an FB ID)
+ * 3. Creates an X11 pixmap backed by the BO so the compositor can render
+ * 
+ * The framebuffer ID can later be used by the renderer to capture frames.
+ */
+static Bool
+drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
+                                        xr_virtual_output_ptr vout,
+                                        int width, int height)
+{
+    ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
+    modesettingPtr ms = modesettingPTR(pScrn);
+    PixmapPtr pixmap;
+    msPixmapPrivPtr ppriv;
+    void *pixmap_ptr = NULL;
+    int ret;
+    int cpp = (pScrn->bitsPerPixel + 7) / 8;
+    int pitch;
+    
+    /* Initialize framebuffer BO structure */
+    memset(&vout->framebuffer_bo, 0, sizeof(vout->framebuffer_bo));
+    vout->framebuffer_id = 0;
+    vout->pixmap = NULL;
+
+    /* Create DRM buffer object (BO) - this allocates memory for the framebuffer */
+    /* We need to call drmmode_create_bo, but it's static, so we'll use a helper */
+    /* Actually, we can create it via dumb_bo_create directly for now */
+    vout->framebuffer_bo.width = width;
+    vout->framebuffer_bo.height = height;
+    
+    /* Create dumb buffer (works on all systems, no GPU required) */
+    vout->framebuffer_bo.dumb = dumb_bo_create(drmmode->fd, width, height,
+                                               drmmode->kbpp);
+    if (!vout->framebuffer_bo.dumb) {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                   "Failed to create off-screen framebuffer BO for '%s'\n",
+                   vout->name);
+        return FALSE;
+    }
+
+    /* Import BO as DRM framebuffer (get FB ID for capture) */
+    ret = drmmode_bo_import(drmmode, &vout->framebuffer_bo,
+                            &vout->framebuffer_id);
+    if (ret != 0) {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                   "Failed to import framebuffer BO for '%s': %s\n",
+                   vout->name, strerror(-ret));
+        drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
+        return FALSE;
+    }
+
+    /* Get pitch for pixmap creation */
+    pitch = drmmode_bo_get_pitch(&vout->framebuffer_bo);
+
+    /* Map the BO to CPU-accessible memory */
+#ifdef GLAMOR_HAS_GBM
+    if (drmmode->glamor && drmmode->gbm && vout->framebuffer_bo.gbm) {
+        /* GBM BO - map via gbm_bo_map if needed */
+        /* For now, we'll create a pixmap that references it differently */
+        pixmap_ptr = NULL; /* Glamor handles this differently */
+    } else
+#endif
+    {
+        /* Dumb buffer - map it */
+        ret = dumb_bo_map(drmmode->fd, vout->framebuffer_bo.dumb);
+        if (ret != 0) {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "Failed to map framebuffer BO for '%s': %s\n",
+                       vout->name, strerror(-ret));
+            drmModeRmFB(drmmode->fd, vout->framebuffer_id);
+            drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
+            return FALSE;
+        }
+        pixmap_ptr = vout->framebuffer_bo.dumb->ptr;
+    }
+
+    /* Create X11 pixmap backed by the framebuffer BO */
+    /* We use CreatePixmap and ModifyPixmapHeader to set up the pixmap */
+    pixmap = (*pScreen->CreatePixmap)(pScreen, 0, 0, pScrn->depth, 0);
+    if (!pixmap) {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                   "Failed to create pixmap for off-screen framebuffer '%s'\n",
+                   vout->name);
+        if (pixmap_ptr && vout->framebuffer_bo.dumb) {
+            munmap(vout->framebuffer_bo.dumb->ptr, vout->framebuffer_bo.dumb->size);
+            vout->framebuffer_bo.dumb->ptr = NULL;
+        }
+        drmModeRmFB(drmmode->fd, vout->framebuffer_id);
+        drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
+        return FALSE;
+    }
+
+    /* Modify pixmap header to use our framebuffer memory */
+    if (!(*pScreen->ModifyPixmapHeader)(pixmap, width, height,
+                                        pScrn->depth, pScrn->bitsPerPixel,
+                                        pitch, pixmap_ptr)) {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                   "Failed to modify pixmap header for off-screen framebuffer '%s'\n",
+                   vout->name);
+        (*pScreen->DestroyPixmap)(pixmap);
+        if (pixmap_ptr && vout->framebuffer_bo.dumb) {
+            munmap(vout->framebuffer_bo.dumb->ptr, vout->framebuffer_bo.dumb->size);
+            vout->framebuffer_bo.dumb->ptr = NULL;
+        }
+        drmModeRmFB(drmmode->fd, vout->framebuffer_id);
+        drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
+        return FALSE;
+    }
+
+    /* Set up pixmap private data to track the BO */
+    ppriv = msGetPixmapPriv(drmmode, pixmap);
+    if (ppriv) {
+        ppriv->fb_id = vout->framebuffer_id;
+        ppriv->backing_bo = vout->framebuffer_bo.dumb;
+    }
+
+    vout->pixmap = pixmap;
+
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "Created off-screen framebuffer for '%s': %dx%d, FB ID %u\n",
+               vout->name, width, height, vout->framebuffer_id);
+
+    return TRUE;
+}
+
+/**
+ * Destroy an off-screen framebuffer for a virtual XR output
+ */
+static void
+drmmode_xr_destroy_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
+                                         xr_virtual_output_ptr vout)
+{
+    ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
+    modesettingPtr ms = modesettingPTR(pScrn);
+
+    if (!vout)
+        return;
+
+    /* Destroy pixmap if it exists */
+    if (vout->pixmap && pScreen) {
+        (*pScreen->DestroyPixmap)(vout->pixmap);
+        vout->pixmap = NULL;
+    }
+
+    /* Remove DRM framebuffer */
+    if (vout->framebuffer_id != 0) {
+        drmModeRmFB(drmmode->fd, vout->framebuffer_id);
+        vout->framebuffer_id = 0;
+    }
+
+    /* Destroy BO (this will also unmap if needed) */
+    if (vout->framebuffer_bo.dumb || vout->framebuffer_bo.gbm) {
+        drmmode_bo_destroy(drmmode, &vout->framebuffer_bo);
+    }
+
+    memset(&vout->framebuffer_bo, 0, sizeof(vout->framebuffer_bo));
+}
+
+/* ============================================================
+ * Virtual CRTC Implementation
+ * ============================================================ */
+
+/* Virtual CRTC function callbacks - handle software-based CRTCs */
+static void
+drmmode_xr_virtual_crtc_dpms(xf86CrtcPtr crtc, int mode)
+{
+    /* Virtual CRTCs don't need DPMS - just track state */
+    drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+    drmmode_crtc->dpms_mode = mode;
+}
+
+static Bool
+drmmode_xr_virtual_crtc_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
+                                       Rotation rotation, int x, int y)
+{
+    /* Virtual CRTCs just update internal state - no hardware programming */
+    if (mode) {
+        crtc->mode = *mode;
+        crtc->x = x;
+        crtc->y = y;
+        crtc->rotation = rotation;
+    }
+    return TRUE;
+}
+
+static void
+drmmode_xr_virtual_crtc_set_cursor_colors(xf86CrtcPtr crtc,
+                                          uint16_t red, uint16_t green, uint16_t blue)
+{
+    /* Virtual CRTCs don't support hardware cursors */
+}
+
+static void
+drmmode_xr_virtual_crtc_set_cursor_position(xf86CrtcPtr crtc, int x, int y)
+{
+    /* Virtual CRTCs don't support hardware cursors */
+}
+
+static Bool
+drmmode_xr_virtual_crtc_show_cursor(xf86CrtcPtr crtc)
+{
+    /* Virtual CRTCs don't support hardware cursors */
+    return TRUE;
+}
+
+static void
+drmmode_xr_virtual_crtc_hide_cursor(xf86CrtcPtr crtc)
+{
+    /* Virtual CRTCs don't support hardware cursors */
+}
+
+static Bool
+drmmode_xr_virtual_crtc_load_cursor_argb(xf86CrtcPtr crtc, CARD32 *image)
+{
+    /* Virtual CRTCs don't support hardware cursors */
+    return TRUE;
+}
+
+static void
+drmmode_xr_virtual_crtc_gamma_set(xf86CrtcPtr crtc,
+                                  uint16_t *red, uint16_t *green, uint16_t *blue,
+                                  int size)
+{
+    drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+    int i;
+    
+    /* Store gamma values but don't program hardware */
+    for (i = 0; i < size && i < 256; i++) {
+        drmmode_crtc->lut_r[i] = red[i];
+        drmmode_crtc->lut_g[i] = green[i];
+        drmmode_crtc->lut_b[i] = blue[i];
+    }
+}
+
+static void
+drmmode_xr_virtual_crtc_destroy(xf86CrtcPtr crtc)
+{
+    /* Virtual CRTCs don't have hardware resources to free */
+    /* The driver_private will be freed by xf86CrtcDestroy */
+}
+
+static Bool
+drmmode_xr_virtual_crtc_set_scanout_pixmap(xf86CrtcPtr crtc, PixmapPtr ppix)
+{
+    /* For virtual CRTCs, we'll track the scanout pixmap but not program hardware */
+    /* This will be used later to create DRM framebuffers for capture */
+    drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+    
+    /* Store reference to scanout pixmap for framebuffer export */
+    /* TODO: Create DRM framebuffer from pixmap for capture by renderer */
+    
+    return TRUE;
+}
+
+static Bool
+drmmode_xr_virtual_crtc_shadow_allocate(xf86CrtcPtr crtc)
+{
+    /* Virtual CRTCs use software framebuffers, shadow allocation not needed */
+    return TRUE;
+}
+
+static void
+drmmode_xr_virtual_crtc_shadow_create(xf86CrtcPtr crtc)
+{
+    /* Virtual CRTCs use software framebuffers, shadow not needed */
+}
+
+static void
+drmmode_xr_virtual_crtc_shadow_destroy(xf86CrtcPtr crtc)
+{
+    /* Virtual CRTCs use software framebuffers, shadow not needed */
+}
+
+/* Function table for virtual CRTCs */
+static const xf86CrtcFuncsRec drmmode_xr_virtual_crtc_funcs = {
+    .dpms = drmmode_xr_virtual_crtc_dpms,
+    .set_mode_major = drmmode_xr_virtual_crtc_set_mode_major,
+    .set_cursor_colors = drmmode_xr_virtual_crtc_set_cursor_colors,
+    .set_cursor_position = drmmode_xr_virtual_crtc_set_cursor_position,
+    .show_cursor_check = drmmode_xr_virtual_crtc_show_cursor,
+    .hide_cursor = drmmode_xr_virtual_crtc_hide_cursor,
+    .load_cursor_argb_check = drmmode_xr_virtual_crtc_load_cursor_argb,
+    .gamma_set = drmmode_xr_virtual_crtc_gamma_set,
+    .destroy = drmmode_xr_virtual_crtc_destroy,
+    .set_scanout_pixmap = drmmode_xr_virtual_crtc_set_scanout_pixmap,
+    .shadow_allocate = drmmode_xr_virtual_crtc_shadow_allocate,
+    .shadow_create = drmmode_xr_virtual_crtc_shadow_create,
+    .shadow_destroy = drmmode_xr_virtual_crtc_shadow_destroy,
+};
+
+/**
+ * Create a virtual CRTC for virtual XR outputs
+ * Virtual CRTCs are software-based and don't have real DRM CRTCs
+ */
+static xf86CrtcPtr
+drmmode_xr_create_virtual_crtc(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
+{
+    xf86CrtcPtr crtc;
+    drmmode_crtc_private_ptr drmmode_crtc;
+    modesettingPtr ms = modesettingPTR(pScrn);
+
+    /* Create the CRTC using virtual function table */
+    crtc = xf86CrtcCreate(pScrn, &drmmode_xr_virtual_crtc_funcs);
+    if (!crtc) {
+        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                   "Failed to create virtual XR CRTC\n");
+        return NULL;
+    }
+
+    /* Allocate private data structure */
+    drmmode_crtc = calloc(1, sizeof(drmmode_crtc_private_rec));
+    if (!drmmode_crtc) {
+        xf86CrtcDestroy(crtc);
+        return NULL;
+    }
+
+    crtc->driver_private = drmmode_crtc;
+
+    /* Initialize virtual CRTC state */
+    drmmode_crtc->drmmode = drmmode;
+    drmmode_crtc->mode_crtc = NULL;  /* No real DRM CRTC for virtual CRTCs */
+    drmmode_crtc->vblank_pipe = 0;   /* Virtual CRTCs don't have vblank pipes */
+    drmmode_crtc->dpms_mode = DPMSModeOn;
+    drmmode_crtc->cursor_up = FALSE;
+    drmmode_crtc->next_msc = UINT64_MAX;
+    drmmode_crtc->need_modeset = FALSE;
+    drmmode_crtc->enable_flipping = FALSE;
+    drmmode_crtc->flipping_active = FALSE;
+    drmmode_crtc->vrr_enabled = FALSE;
+    drmmode_crtc->use_gamma_lut = FALSE;
+
+    /* Initialize lists */
+    xorg_list_init(&drmmode_crtc->mode_list);
+    xorg_list_init(&drmmode_crtc->tearfree.dri_flip_list);
+
+    /* Virtual CRTCs don't have DRM properties - initialize empty prop arrays */
+    memset(drmmode_crtc->props, 0, sizeof(drmmode_crtc->props));
+    memset(drmmode_crtc->props_plane, 0, sizeof(drmmode_crtc->props_plane));
+
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+               "Created virtual XR CRTC\n");
+
+    return crtc;
 }
