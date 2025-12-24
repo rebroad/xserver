@@ -28,6 +28,7 @@
 #include <xf86drm.h>
 #include <string.h>
 #include <stdlib.h>
+#include <strings.h>  /* for strcasestr */
 #include <sys/mman.h>
 #include "xf86.h"
 #include "xf86str.h"
@@ -1006,11 +1007,149 @@ drmmode_xr_get_ar_mode(ScrnInfoPtr pScrn)
  * Set AR mode for virtual XR connectors
  */
 /**
+ * Check EDID descriptor strings for XR device identifiers
+ * 
+ * EDID descriptor blocks start at byte 54, each descriptor is 18 bytes.
+ * Descriptors can be monitor name, serial number, etc.
+ */
+static Bool
+drmmode_xr_check_edid_for_xr_device(drmModePropertyBlobPtr edid_blob)
+{
+    const unsigned char *edid;
+    int i, j;
+    char descriptor_text[14]; /* EDID descriptor text is 13 bytes + null terminator */
+    
+    if (!edid_blob || !edid_blob->data || edid_blob->length < 128)
+        return FALSE;
+    
+    edid = (const unsigned char *)edid_blob->data;
+    
+    /* Check EDID descriptor blocks (bytes 54-125, 4 descriptors of 18 bytes each) */
+    for (i = 54; i <= 108; i += 18) {
+        /* Descriptor type is at offset 3 within each descriptor */
+        if (edid[i] != 0 || edid[i + 1] != 0) /* Not a text descriptor */
+            continue;
+        
+        /* Extract descriptor text (bytes 5-17, 13 characters) */
+        memset(descriptor_text, 0, sizeof(descriptor_text));
+        for (j = 0; j < 13 && (i + 5 + j) < edid_blob->length; j++) {
+            char c = (char)edid[i + 5 + j];
+            if (c == '\n' || c == '\r')
+                break;
+            if (c >= 32 && c < 127) /* Printable ASCII */
+                descriptor_text[j] = c;
+        }
+        
+        /* Check for XR device identifiers (case-insensitive) */
+        if (strcasestr(descriptor_text, "XREAL") ||
+            strcasestr(descriptor_text, "VITURE") ||
+            strcasestr(descriptor_text, "nreal") ||  /* Older XREAL branding */
+            strcasestr(descriptor_text, "nReal")) {  /* Older XREAL branding variant */
+            return TRUE;
+        }
+    }
+    
+    return FALSE;
+}
+
+/**
+ * Detect XR device from EDID and mark connector as non_desktop if detected
+ */
+static Bool
+drmmode_xr_detect_and_mark_xr_output(ScrnInfoPtr pScrn, xf86OutputPtr output,
+                                      drmmode_output_private_ptr drmmode_output)
+{
+    drmmode_ptr drmmode = drmmode_output->drmmode;
+    drmModeConnectorPtr koutput = drmmode_output->mode_output;
+    drmModePropertyBlobPtr edid_blob = NULL;
+    Bool is_xr_device = FALSE;
+    int i;
+    
+    if (!koutput)
+        return FALSE;
+    
+    /* Get EDID blob if available */
+    if (drmmode_output->edid_blob) {
+        edid_blob = drmmode_output->edid_blob;
+    } else {
+        /* Try to get EDID blob directly from connector */
+        /* Replicate koutput_get_prop_blob logic (it's static in drmmode_display.c) */
+        for (i = 0; i < koutput->count_props; i++) {
+            drmModePropertyPtr prop = drmModeGetProperty(drmmode->fd, koutput->props[i]);
+            if (!prop)
+                continue;
+            
+            /* Check if property is BLOB type and named "EDID" */
+            if ((prop->flags & DRM_MODE_PROP_BLOB) && !strcmp(prop->name, "EDID")) {
+                edid_blob = drmModeGetPropertyBlob(drmmode->fd, koutput->prop_values[i]);
+                drmModeFreeProperty(prop);
+                break;
+            }
+            
+            drmModeFreeProperty(prop);
+        }
+    }
+    
+    /* Check EDID for XR device identifiers */
+    if (edid_blob) {
+        is_xr_device = drmmode_xr_check_edid_for_xr_device(edid_blob);
+        
+        /* Free EDID blob if we fetched it ourselves */
+        if (edid_blob != drmmode_output->edid_blob) {
+            drmModeFreePropertyBlob(edid_blob);
+        }
+    }
+    
+    /* Also check connector name as fallback (in case EDID is not available) */
+    if (!is_xr_device && output->name) {
+        const char *name_lower = output->name;
+        /* Simple check - look for XREAL/VITURE in connector name (case-insensitive via strcasestr) */
+        if (strcasestr(name_lower, "xreal") ||
+            strcasestr(name_lower, "viture") ||
+            strcasestr(name_lower, "nreal")) {
+            is_xr_device = TRUE;
+        }
+    }
+    
+    /* If detected as XR device, mark as non_desktop via DRM property */
+    if (is_xr_device) {
+        /* Find and set the non_desktop property on the connector */
+        for (i = 0; i < koutput->count_props; i++) {
+            drmModePropertyPtr prop = drmModeGetProperty(drmmode->fd, koutput->props[i]);
+            if (!prop)
+                continue;
+            
+            if (strcmp(prop->name, RR_PROPERTY_NON_DESKTOP) == 0) {
+                uint64_t value = 1; /* Set non_desktop to 1 (true) */
+                drmModeConnectorSetProperty(drmmode->fd, koutput->connector_id,
+                                          prop->prop_id, value);
+                output->non_desktop = TRUE;
+                xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                           "Detected XR device '%s' via EDID, marked as non_desktop\n",
+                           output->name);
+                drmModeFreeProperty(prop);
+                return TRUE;
+            }
+            
+            drmModeFreeProperty(prop);
+        }
+        
+        /* If property not found, still mark output as non_desktop in software */
+        output->non_desktop = TRUE;
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                   "Detected XR device '%s' via EDID, marked as non_desktop (property unavailable)\n",
+                   output->name);
+        return TRUE;
+    }
+    
+    return FALSE;
+}
+
+/**
  * Check if an output is a physical XR display
  * 
- * For now, we check if the output is marked as non_desktop.
- * TODO: we'll enhance this to check EDID vendor/product strings
- * to detect XREAL/VITURE glasses specifically.
+ * Detects XREAL/VITURE glasses via EDID descriptor strings and
+ * marks them as non_desktop if detected.
  */
 static Bool
 drmmode_xr_is_physical_xr_output(xf86OutputPtr output)
@@ -1034,11 +1173,13 @@ drmmode_xr_is_physical_xr_output(xf86OutputPtr output)
     if (output->name && strncmp(output->name, "XR-", 3) == 0)
         return FALSE;
     
-    /* For now, check if marked as non_desktop (item #4 will enhance this with EDID detection) */
+    /* Check if already marked as non_desktop (could be from previous detection or kernel) */
     if (output->non_desktop)
         return TRUE;
     
-    /* TODO in item #4: Check EDID vendor/product strings for XREAL/VITURE */
+    /* Detect XR device from EDID and mark as non_desktop if found */
+    if (drmmode_xr_detect_and_mark_xr_output(output->scrn, output, drmmode_output))
+        return TRUE;
     
     return FALSE;
 }
