@@ -63,6 +63,7 @@ extern const xf86CrtcFuncsRec drmmode_crtc_funcs;
 /* Structure to track a dynamically created virtual output */
 typedef struct _xr_virtual_output_rec {
     xf86OutputPtr output;          /* xf86OutputPtr for this virtual output */
+    xf86CrtcPtr crtc;              /* Virtual CRTC assigned to this output */
     RROutputPtr randr_output;      /* RandR output */
     char *name;                    /* Output name (e.g., "XR-0", "XR-1") */
     int width;                     /* Current width */
@@ -97,6 +98,19 @@ drmmode_xr_find_virtual_output(modesettingPtr ms, const char *name)
     xr_virtual_output_ptr vout = ms->xr_virtual_outputs;
     while (vout) {
         if (vout->name && strcmp(vout->name, name) == 0)
+            return vout;
+        vout = vout->next;
+    }
+    return NULL;
+}
+
+/* Find a virtual output by CRTC */
+static xr_virtual_output_ptr
+drmmode_xr_find_virtual_output_by_crtc(modesettingPtr ms, xf86CrtcPtr crtc)
+{
+    xr_virtual_output_ptr vout = ms->xr_virtual_outputs;
+    while (vout) {
+        if (vout->crtc == crtc)
             return vout;
         vout = vout->next;
     }
@@ -198,40 +212,59 @@ drmmode_xr_virtual_set_modes(xf86OutputPtr output, int width, int height, int re
     int nmode = 0;
     char mode_name[32];
 
-    /* Create a single mode with the specified dimensions */
-    mode = xf86CVTMode(width, height, refresh, FALSE, FALSE);
-    if (!mode)
-        return;
+    /* Create multiple common modes for virtual outputs */
+    /* This allows users to change resolution via standard RandR APIs */
+    int common_widths[] = {1920, 2560, 3840, 0};
+    int common_heights[] = {1080, 1440, 2160, 0};
+    int i, j;
 
-    snprintf(mode_name, sizeof(mode_name), "%dx%d", width, height);
-    mode->name = XNFstrdup(mode_name);
-    mode->type = M_T_USERPREF | M_T_PREFERRED;
+    for (i = 0; common_widths[i] != 0; i++) {
+        for (j = 0; common_heights[j] != 0; j++) {
+            int w = common_widths[i];
+            int h = common_heights[j];
+            
+            /* Create mode */
+            mode = xf86CVTMode(w, h, refresh, FALSE, FALSE);
+            if (!mode)
+                continue;
 
-    /* Convert to RRMode */
-    {
-        xRRModeInfo modeInfo;
-        RRModePtr rrmode;
-
-        modeInfo.nameLength = strlen(mode->name);
-        modeInfo.width = mode->HDisplay;
-        modeInfo.dotClock = mode->Clock * 1000;
-        modeInfo.hSyncStart = mode->HSyncStart;
-        modeInfo.hSyncEnd = mode->HSyncEnd;
-        modeInfo.hTotal = mode->HTotal;
-        modeInfo.hSkew = mode->HSkew;
-        modeInfo.height = mode->VDisplay;
-        modeInfo.vSyncStart = mode->VSyncStart;
-        modeInfo.vSyncEnd = mode->VSyncEnd;
-        modeInfo.vTotal = mode->VTotal;
-        modeInfo.modeFlags = mode->Flags;
-
-        rrmode = RRModeGet(&modeInfo, mode->name);
-        if (rrmode) {
-            rrmodes = calloc(1, sizeof(RRModePtr));
-            if (rrmodes) {
-                rrmodes[0] = rrmode;
-                nmode = 1;
+            snprintf(mode_name, sizeof(mode_name), "%dx%d", w, h);
+            mode->name = XNFstrdup(mode_name);
+            mode->type = M_T_USERPREF;
+            if (w == width && h == height) {
+                mode->type |= M_T_PREFERRED;
             }
+
+            /* Convert to RRMode */
+            {
+                xRRModeInfo modeInfo;
+                RRModePtr rrmode;
+
+                modeInfo.nameLength = strlen(mode->name);
+                modeInfo.width = mode->HDisplay;
+                modeInfo.dotClock = mode->Clock * 1000;
+                modeInfo.hSyncStart = mode->HSyncStart;
+                modeInfo.hSyncEnd = mode->HSyncEnd;
+                modeInfo.hTotal = mode->HTotal;
+                modeInfo.hSkew = mode->HSkew;
+                modeInfo.height = mode->VDisplay;
+                modeInfo.vSyncStart = mode->VSyncStart;
+                modeInfo.vSyncEnd = mode->VSyncEnd;
+                modeInfo.vTotal = mode->VTotal;
+                modeInfo.modeFlags = mode->Flags;
+
+                rrmode = RRModeGet(&modeInfo, mode->name);
+                if (rrmode) {
+                    RRModePtr *new_rrmodes = realloc(rrmodes, (nmode + 1) * sizeof(RRModePtr));
+                    if (new_rrmodes) {
+                        rrmodes = new_rrmodes;
+                        rrmodes[nmode] = rrmode;
+                        nmode++;
+                    }
+                }
+            }
+
+            xf86DeleteMode(&output->probed_modes, mode);
         }
     }
 
@@ -240,7 +273,6 @@ drmmode_xr_virtual_set_modes(xf86OutputPtr output, int width, int height, int re
     }
 
     free(rrmodes);
-    xf86DeleteMode(&output->probed_modes, mode);
 }
 
 /**
@@ -408,6 +440,7 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     }
 
     vout->output = output;
+    vout->crtc = crtc;  /* Store CRTC reference for easy lookup */
     vout->randr_output = output->randr_output;
     vout->name = strdup(name);
     vout->width = width;
@@ -482,8 +515,8 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
     }
 
     /* Clean up CRTC if assigned */
-    if (vout->output && vout->output->crtc) {
-        xf86CrtcPtr crtc = vout->output->crtc;
+    if (vout->crtc) {
+        xf86CrtcPtr crtc = vout->crtc;
         /* Destroy RandR CRTC if it exists */
         if (crtc->randr_crtc) {
             RRCrtcDestroy(crtc->randr_crtc);
@@ -491,7 +524,10 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
         }
         /* Destroy XF86 CRTC */
         xf86CrtcDestroy(crtc);
-        vout->output->crtc = NULL;
+        vout->crtc = NULL;
+        if (vout->output) {
+            vout->output->crtc = NULL;
+        }
     }
 
     /* Destroy RandR output first (before xf86Output) */
@@ -1578,13 +1614,54 @@ static Bool
 drmmode_xr_virtual_crtc_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
                                        Rotation rotation, int x, int y)
 {
+    ScrnInfoPtr pScrn = crtc->scrn;
+    modesettingPtr ms = modesettingPTR(pScrn);
+    drmmode_ptr drmmode = &ms->drmmode;
+    xr_virtual_output_ptr vout;
+    int new_width, new_height;
+    Bool framebuffer_resized = FALSE;
+
     /* Virtual CRTCs just update internal state - no hardware programming */
     if (mode) {
+        new_width = mode->HDisplay;
+        new_height = mode->VDisplay;
+
+        /* Find the virtual output associated with this CRTC */
+        vout = drmmode_xr_find_virtual_output_by_crtc(ms, crtc);
+        
+        if (vout) {
+            /* Check if framebuffer needs to be resized */
+            if (vout->width != new_width || vout->height != new_height) {
+                xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                           "Resizing virtual XR output '%s' framebuffer from %dx%d to %dx%d\n",
+                           vout->name, vout->width, vout->height, new_width, new_height);
+
+                /* Destroy old framebuffer */
+                drmmode_xr_destroy_offscreen_framebuffer(pScrn, drmmode, vout);
+
+                /* Create new framebuffer at new resolution */
+                if (!drmmode_xr_create_offscreen_framebuffer(pScrn, drmmode, vout,
+                                                             new_width, new_height)) {
+                    xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                               "Failed to resize framebuffer for '%s' to %dx%d\n",
+                               vout->name, new_width, new_height);
+                    /* Continue anyway - mode change will still update CRTC state */
+                } else {
+                    framebuffer_resized = TRUE;
+                    /* Update virtual output dimensions */
+                    vout->width = new_width;
+                    vout->height = new_height;
+                }
+            }
+        }
+
+        /* Update CRTC state */
         crtc->mode = *mode;
         crtc->x = x;
         crtc->y = y;
         crtc->rotation = rotation;
     }
+
     return TRUE;
 }
 
