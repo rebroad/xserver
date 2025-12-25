@@ -1732,6 +1732,10 @@ drmmode_xr_virtual_crtc_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
                                vout->name, new_width, new_height);
                     /* Continue anyway - mode change will still update CRTC state */
                 } else {
+                    /* Update FRAMEBUFFER_ID property with new framebuffer ID */
+                    if (vout->randr_output) {
+                        drmmode_xr_virtual_ensure_fb_id_property(pScrn, vout->randr_output, vout->framebuffer_id);
+                    }
                     /* Update virtual output dimensions */
                     vout->width = new_width;
                     vout->height = new_height;
