@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <strings.h>  /* for strcasestr */
 #include <sys/mman.h>
+#include <errno.h>
 #include "xf86.h"
 #include "xf86str.h"
 #include "xf86Crtc.h"
@@ -59,6 +60,7 @@ extern const xf86CrtcFuncsRec drmmode_crtc_funcs;
 #define XR_WIDTH_PROPERTY "XR_WIDTH"
 #define XR_HEIGHT_PROPERTY "XR_HEIGHT"
 #define XR_REFRESH_PROPERTY "XR_REFRESH"
+#define XR_FB_ID_PROPERTY "FRAMEBUFFER_ID"
 
 /* Structure to track a dynamically created virtual output */
 typedef struct _xr_virtual_output_rec {
@@ -90,6 +92,7 @@ static void drmmode_xr_destroy_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_
 #define XR_WIDTH_ATOM() MakeAtom(XR_WIDTH_PROPERTY, strlen(XR_WIDTH_PROPERTY), TRUE)
 #define XR_HEIGHT_ATOM() MakeAtom(XR_HEIGHT_PROPERTY, strlen(XR_HEIGHT_PROPERTY), TRUE)
 #define XR_REFRESH_ATOM() MakeAtom(XR_REFRESH_PROPERTY, strlen(XR_REFRESH_PROPERTY), TRUE)
+#define XR_FB_ID_ATOM() MakeAtom(XR_FB_ID_PROPERTY, strlen(XR_FB_ID_PROPERTY), TRUE)
 
 /* Find a virtual output by name */
 static xr_virtual_output_ptr
@@ -115,6 +118,41 @@ drmmode_xr_find_virtual_output_by_crtc(modesettingPtr ms, xf86CrtcPtr crtc)
         vout = vout->next;
     }
     return NULL;
+}
+
+/* Create or ensure FRAMEBUFFER_ID property exists on a virtual output */
+static Bool
+drmmode_xr_virtual_ensure_fb_id_property(ScrnInfoPtr pScrn, RROutputPtr randr_output, uint32_t fb_id)
+{
+    Atom name = XR_FB_ID_ATOM();
+    INT32 dummy = 0;
+    int err;
+
+    if (name == BAD_RESOURCE) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to create FRAMEBUFFER_ID atom\n");
+        return FALSE;
+    }
+
+    /* Check if property already exists */
+    if (!RRQueryOutputProperty(randr_output, name)) {
+        /* Property doesn't exist, create it */
+        err = RRConfigureOutputProperty(randr_output, name, FALSE, FALSE, FALSE, 1, &dummy);
+        if (err != 0) {
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to configure FRAMEBUFFER_ID property: %d\n", err);
+            return FALSE;
+        }
+    }
+
+    /* Set/update the property value */
+    err = RRChangeOutputProperty(randr_output, name, XA_INTEGER, 32, PropModeReplace, 1,
+                                   (unsigned char *)&fb_id, FALSE, FALSE);
+    if (err != 0) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to set FRAMEBUFFER_ID property: %d\n", err);
+        return FALSE;
+    }
+
+    RRPostPendingProperties(randr_output);
+    return TRUE;
 }
 
 /* Create or ensure AR_MODE property exists on an output */
@@ -1558,11 +1596,59 @@ bo_created:
 pixmap_created:
     vout->pixmap = pixmap;
 
+    /* Set FRAMEBUFFER_ID property on RandR output for renderer access */
+    if (vout->randr_output) {
+        drmmode_xr_virtual_ensure_fb_id_property(pScrn, vout->randr_output, vout->framebuffer_id);
+    }
+
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
                "Created off-screen framebuffer for '%s': %dx%d, FB ID %u\n",
                vout->name, width, height, vout->framebuffer_id);
 
     return TRUE;
+}
+
+/**
+ * Export a virtual output's framebuffer as a DMA-BUF file descriptor
+ * 
+ * This allows the renderer to import the framebuffer via EGL DMA-BUF extensions
+ * for zero-copy capture.
+ * 
+ * @param drmmode DRM modesetting context
+ * @param vout Virtual output whose framebuffer to export
+ * @param dmabuf_fd Output parameter for the DMA-BUF file descriptor
+ * @return 0 on success, negative error code on failure
+ */
+static int
+drmmode_xr_export_framebuffer_to_dmabuf(drmmode_ptr drmmode,
+                                         xr_virtual_output_ptr vout,
+                                         int *dmabuf_fd)
+{
+    uint32_t handle;
+    int ret;
+    
+    if (!vout || !dmabuf_fd) {
+        return -EINVAL;
+    }
+    
+    if (!vout->framebuffer_bo.dumb && !vout->framebuffer_bo.gbm) {
+        return -ENOENT;  /* No framebuffer allocated */
+    }
+    
+    /* Get the DRM handle from the buffer object */
+    handle = drmmode_bo_get_handle(&vout->framebuffer_bo);
+    if (handle == 0) {
+        return -EINVAL;
+    }
+    
+    /* Export handle to DMA-BUF file descriptor */
+    /* Note: drmPrimeHandleToFD is provided by libdrm (xf86drm.h) */
+    ret = drmPrimeHandleToFD(drmmode->fd, handle, DRM_CLOEXEC | DRM_RDWR, dmabuf_fd);
+    if (ret != 0) {
+        return -errno;
+    }
+    
+    return 0;
 }
 
 /**
@@ -1727,7 +1813,10 @@ drmmode_xr_virtual_crtc_set_scanout_pixmap(xf86CrtcPtr crtc, PixmapPtr ppix)
     (void)ppix;  /* unused */
     
     /* Store reference to scanout pixmap for framebuffer export */
-    /* TODO: Create DRM framebuffer from pixmap for capture by renderer */
+    /* NOTE: Framebuffer export function exists (drmmode_xr_export_framebuffer_to_dmabuf),
+     * but the renderer needs a way to get the framebuffer_id. This could be exposed
+     * via a RandR property or IPC mechanism. The renderer can also query the framebuffer
+     * directly via DRM if it knows the ID (drmModeGetFB). */
     
     return TRUE;
 }
