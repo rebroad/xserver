@@ -1619,7 +1619,6 @@ drmmode_xr_virtual_crtc_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
     drmmode_ptr drmmode = &ms->drmmode;
     xr_virtual_output_ptr vout;
     int new_width, new_height;
-    Bool framebuffer_resized = FALSE;
 
     /* Virtual CRTCs just update internal state - no hardware programming */
     if (mode) {
@@ -1647,7 +1646,6 @@ drmmode_xr_virtual_crtc_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
                                vout->name, new_width, new_height);
                     /* Continue anyway - mode change will still update CRTC state */
                 } else {
-                    framebuffer_resized = TRUE;
                     /* Update virtual output dimensions */
                     vout->width = new_width;
                     vout->height = new_height;
