@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <strings.h>  /* for strcasestr */
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <errno.h>
 #include "xf86.h"
 #include "xf86str.h"
@@ -54,9 +55,8 @@ extern const xf86CrtcFuncsRec drmmode_crtc_funcs;
 /* Functions we need are declared in drmmode_display.h */
 
 #define XR_MANAGER_OUTPUT_NAME "XR-Manager"
-#define XR_AR_MODE_PROPERTY "AR_MODE"
-#define XR_CREATE_OUTPUT_PROPERTY "CREATE_XR_OUTPUT"
-#define XR_DELETE_OUTPUT_PROPERTY "DELETE_XR_OUTPUT"
+#define CREATE_XR_OUTPUT_PROPERTY "CREATE_XR_OUTPUT"
+#define DELETE_XR_OUTPUT_PROPERTY "DELETE_XR_OUTPUT"
 #define XR_WIDTH_PROPERTY "XR_WIDTH"
 #define XR_HEIGHT_PROPERTY "XR_HEIGHT"
 #define XR_REFRESH_PROPERTY "XR_REFRESH"
@@ -86,9 +86,8 @@ static void drmmode_xr_destroy_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_
                                                       xr_virtual_output_ptr vout);
 
 /* Get property atoms - use macros to avoid function call overhead */
-#define XR_AR_MODE_ATOM() MakeAtom(XR_AR_MODE_PROPERTY, strlen(XR_AR_MODE_PROPERTY), TRUE)
-#define XR_CREATE_OUTPUT_ATOM() MakeAtom(XR_CREATE_OUTPUT_PROPERTY, strlen(XR_CREATE_OUTPUT_PROPERTY), TRUE)
-#define XR_DELETE_OUTPUT_ATOM() MakeAtom(XR_DELETE_OUTPUT_PROPERTY, strlen(XR_DELETE_OUTPUT_PROPERTY), TRUE)
+#define CREATE_XR_OUTPUT_ATOM() MakeAtom(CREATE_XR_OUTPUT_PROPERTY, strlen(CREATE_XR_OUTPUT_PROPERTY), TRUE)
+#define DELETE_XR_OUTPUT_ATOM() MakeAtom(DELETE_XR_OUTPUT_PROPERTY, strlen(DELETE_XR_OUTPUT_PROPERTY), TRUE)
 #define XR_WIDTH_ATOM() MakeAtom(XR_WIDTH_PROPERTY, strlen(XR_WIDTH_PROPERTY), TRUE)
 #define XR_HEIGHT_ATOM() MakeAtom(XR_HEIGHT_PROPERTY, strlen(XR_HEIGHT_PROPERTY), TRUE)
 #define XR_REFRESH_ATOM() MakeAtom(XR_REFRESH_PROPERTY, strlen(XR_REFRESH_PROPERTY), TRUE)
@@ -152,41 +151,6 @@ drmmode_xr_virtual_ensure_fb_id_property(ScrnInfoPtr pScrn, RROutputPtr randr_ou
     }
 
     RRPostPendingProperties(randr_output);
-    return TRUE;
-}
-
-/* Create or ensure AR_MODE property exists on an output */
-static Bool
-drmmode_xr_virtual_ensure_ar_mode_property(ScrnInfoPtr pScrn, RROutputPtr randr_output)
-{
-    Atom name = XR_AR_MODE_ATOM();
-    INT32 value = 0;
-    int err;
-
-    if (name == BAD_RESOURCE) {
-        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to create AR_MODE atom\n");
-        return FALSE;
-    }
-
-    /* Check if property already exists */
-    if (RRQueryOutputProperty(randr_output, name)) {
-        return TRUE;
-    }
-
-    /* Property doesn't exist, create it */
-    err = RRConfigureOutputProperty(randr_output, name, FALSE, FALSE, TRUE, 1, &value);
-    if (err != 0) {
-        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to configure AR_MODE property: %d\n", err);
-        return FALSE;
-    }
-
-    err = RRChangeOutputProperty(randr_output, name, XA_INTEGER, 32, PropModeReplace, 1,
-                                   &value, FALSE, FALSE);
-    if (err != 0) {
-        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to set AR_MODE property: %d\n", err);
-        return FALSE;
-    }
-
     return TRUE;
 }
 
@@ -401,9 +365,6 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
 
     /* Set modes */
     drmmode_xr_virtual_set_modes(output, width, height, refresh);
-
-    /* Create AR_MODE property */
-    drmmode_xr_virtual_ensure_ar_mode_property(pScrn, output->randr_output);
 
     /* Create resize properties */
     {
@@ -668,31 +629,9 @@ drmmode_xr_manager_set_property(xf86OutputPtr output, Atom property,
     if (!prop_name)
         return FALSE;
 
-    /* Handle AR_MODE property */
-    if (strcmp(prop_name, XR_AR_MODE_PROPERTY) == 0) {
-        INT32 ar_mode_value;
-        
-        if (value->type != XA_INTEGER || value->format != 32 || value->size != 1) {
-            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                       "AR_MODE property must be INTEGER format\n");
-            return FALSE;
-        }
-        
-        ar_mode_value = *(INT32 *)value->data;
-        if (drmmode_xr_set_ar_mode(pScrn, ar_mode_value != 0)) {
-            xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                       "AR mode %s\n", ar_mode_value ? "enabled" : "disabled");
-            return TRUE;
-        } else {
-            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                       "Failed to set AR mode\n");
-            return FALSE;
-        }
-    }
-
-    /* Only handle our other custom properties */
-    if (strcmp(prop_name, XR_CREATE_OUTPUT_PROPERTY) != 0 &&
-        strcmp(prop_name, XR_DELETE_OUTPUT_PROPERTY) != 0) {
+    /* Only handle our custom properties */
+    if (strcmp(prop_name, CREATE_XR_OUTPUT_PROPERTY) != 0 &&
+        strcmp(prop_name, DELETE_XR_OUTPUT_PROPERTY) != 0) {
         return FALSE; /* Let default handler deal with it */
     }
 
@@ -707,8 +646,9 @@ drmmode_xr_manager_set_property(xf86OutputPtr output, Atom property,
     if (!command)
         return FALSE;
 
-    if (strcmp(prop_name, XR_CREATE_OUTPUT_PROPERTY) == 0) {
-        /* Format: "XR-0:1920:1080:60" or "XR-0:1920:1080" (refresh defaults to 60) */
+    if (strcmp(prop_name, CREATE_XR_OUTPUT_PROPERTY) == 0) {
+        /* Format: "NAME:WIDTH:HEIGHT:REFRESH" or "NAME:WIDTH:HEIGHT" (refresh defaults to 60) */
+        /* Name can be arbitrary (e.g., "XR-0", "REMOTE-0", "STREAM-0", etc.) */
         name = command;
         end = strchr(name, ':');
         if (end) {
@@ -742,8 +682,8 @@ drmmode_xr_manager_set_property(xf86OutputPtr output, Atom property,
             free(command);
             return FALSE;
         }
-    } else if (strcmp(prop_name, XR_DELETE_OUTPUT_PROPERTY) == 0) {
-        /* Format: "XR-0" */
+    } else if (strcmp(prop_name, DELETE_XR_OUTPUT_PROPERTY) == 0) {
+        /* Format: "NAME" (virtual display name is arbitrary) */
         if (drmmode_xr_delete_virtual_output(pScrn, command)) {
             xf86DrvMsg(pScrn->scrnIndex, X_INFO,
                        "Successfully deleted virtual output '%s'\n", command);
@@ -940,8 +880,8 @@ drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn)
     }
 
     /* Create CREATE_XR_OUTPUT and DELETE_XR_OUTPUT properties */
-    create_atom = XR_CREATE_OUTPUT_ATOM();
-    delete_atom = XR_DELETE_OUTPUT_ATOM();
+    create_atom = CREATE_XR_OUTPUT_ATOM();
+    delete_atom = DELETE_XR_OUTPUT_ATOM();
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
                "Creating properties: create_atom=%lu, delete_atom=%lu\n",
@@ -1243,8 +1183,15 @@ drmmode_xr_is_physical_xr_output(xf86OutputPtr output)
     if (strcmp(output->name, XR_MANAGER_OUTPUT_NAME) == 0)
         return FALSE;
     
-    /* Skip virtual XR outputs (they start with "XR-") */
-    if (output->name && strncmp(output->name, "XR-", 3) == 0)
+    /* Skip virtual outputs (they are managed via VIRTUAL-MANAGER) */
+    /* Note: Virtual display names are arbitrary, not restricted to "XR-*" prefix */
+    /* We identify virtual outputs by checking if they're in the xr_virtual_outputs list */
+    /* For now, skip any output that starts with common virtual display prefixes */
+    /* This is a heuristic - proper detection would check the virtual outputs list */
+    if (output->name && (strncmp(output->name, "XR-", 3) == 0 ||
+                         strncmp(output->name, "REMOTE-", 7) == 0 ||
+                         strncmp(output->name, "STREAM-", 7) == 0 ||
+                         strncmp(output->name, "VIRTUAL-", 8) == 0))
         return FALSE;
     
     /* Check if already marked as non_desktop (could be from previous detection or kernel) */
@@ -1609,49 +1556,6 @@ pixmap_created:
 }
 
 /**
- * Export a virtual output's framebuffer as a DMA-BUF file descriptor
- * 
- * This allows the renderer to import the framebuffer via EGL DMA-BUF extensions
- * for zero-copy capture.
- * 
- * @param drmmode DRM modesetting context
- * @param vout Virtual output whose framebuffer to export
- * @param dmabuf_fd Output parameter for the DMA-BUF file descriptor
- * @return 0 on success, negative error code on failure
- */
-static int
-drmmode_xr_export_framebuffer_to_dmabuf(drmmode_ptr drmmode,
-                                         xr_virtual_output_ptr vout,
-                                         int *dmabuf_fd)
-{
-    uint32_t handle;
-    int ret;
-    
-    if (!vout || !dmabuf_fd) {
-        return -EINVAL;
-    }
-    
-    if (!vout->framebuffer_bo.dumb && !vout->framebuffer_bo.gbm) {
-        return -ENOENT;  /* No framebuffer allocated */
-    }
-    
-    /* Get the DRM handle from the buffer object */
-    handle = drmmode_bo_get_handle(&vout->framebuffer_bo);
-    if (handle == 0) {
-        return -EINVAL;
-    }
-    
-    /* Export handle to DMA-BUF file descriptor */
-    /* Note: drmPrimeHandleToFD is provided by libdrm (xf86drm.h) */
-    ret = drmPrimeHandleToFD(drmmode->fd, handle, DRM_CLOEXEC | DRM_RDWR, dmabuf_fd);
-    if (ret != 0) {
-        return -errno;
-    }
-    
-    return 0;
-}
-
-/**
  * Destroy an off-screen framebuffer for a virtual XR output
  */
 static void
@@ -1817,10 +1721,6 @@ drmmode_xr_virtual_crtc_set_scanout_pixmap(xf86CrtcPtr crtc, PixmapPtr ppix)
     (void)ppix;  /* unused */
     
     /* Store reference to scanout pixmap for framebuffer export */
-    /* NOTE: Framebuffer export function exists (drmmode_xr_export_framebuffer_to_dmabuf),
-     * but the renderer needs a way to get the framebuffer_id. This could be exposed
-     * via a RandR property or IPC mechanism. The renderer can also query the framebuffer
-     * directly via DRM if it knows the ID (drmModeGetFB). */
     
     return TRUE;
 }
