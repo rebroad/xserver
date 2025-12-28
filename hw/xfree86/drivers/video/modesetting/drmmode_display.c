@@ -58,6 +58,7 @@
 #include <X11/extensions/dpmsconst.h>
 
 #include "driver.h"
+#include "randr/randrstr_priv.h"
 
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
@@ -70,6 +71,62 @@ static Bool drmmode_xf86crtc_resize(ScrnInfoPtr scrn, int width, int height);
 static PixmapPtr drmmode_create_pixmap_header(ScreenPtr pScreen, int width, int height,
                                               int depth, int bitsPerPixel, int devKind,
                                               void *pPixData);
+
+/* Create or ensure FRAMEBUFFER_ID property exists on a standard output */
+static Bool
+drmmode_output_ensure_fb_id_property(ScrnInfoPtr pScrn, RROutputPtr randr_output, uint32_t fb_id)
+{
+    Atom name = MakeAtom("FRAMEBUFFER_ID", strlen("FRAMEBUFFER_ID"), TRUE);
+    INT32 dummy = 0;
+    int err;
+
+    if (name == BAD_RESOURCE || !randr_output) {
+        return FALSE;
+    }
+
+    /* Check if property already exists */
+    if (!RRQueryOutputProperty(randr_output, name)) {
+        /* Property doesn't exist, create it */
+        err = RRConfigureOutputProperty(randr_output, name, FALSE, FALSE, FALSE, 1, &dummy);
+        if (err != 0) {
+            xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to configure FRAMEBUFFER_ID property: %d\n", err);
+            return FALSE;
+        }
+    }
+
+    /* Set/update the property value */
+    err = RRChangeOutputProperty(randr_output, name, XA_INTEGER, 32, PropModeReplace, 1,
+                                   (unsigned char *)&fb_id, FALSE, FALSE);
+    if (err != 0) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to set FRAMEBUFFER_ID property: %d\n", err);
+        return FALSE;
+    }
+
+    RRPostPendingProperties(randr_output);
+    return TRUE;
+}
+
+/* Update FRAMEBUFFER_ID property for all outputs connected to a CRTC */
+static void
+drmmode_crtc_update_output_fb_id(xf86CrtcPtr crtc)
+{
+    xf86CrtcConfigPtr xf86_config = XF86_CRTC_CONFIG_PTR(crtc->scrn);
+    uint32_t fb_id;
+    int x, y;
+    int i;
+
+    if (!drmmode_crtc_get_fb_id(crtc, &fb_id, &x, &y))
+        return;
+
+    for (i = 0; i < xf86_config->num_output; i++) {
+        xf86OutputPtr output = xf86_config->output[i];
+
+        if (output->crtc != crtc || !output->randr_output)
+            continue;
+
+        drmmode_output_ensure_fb_id_property(crtc->scrn, output->randr_output, fb_id);
+    }
+}
 
 static const struct drm_color_ctm ctm_identity = { {
     1ULL << 32, 0, 0,
@@ -923,6 +980,8 @@ drmmode_crtc_set_mode(xf86CrtcPtr crtc, Bool test_only)
                 else if (drmmode_output->current_crtc == crtc)
                     drmmode_output->current_crtc = NULL;
             }
+            /* Update FRAMEBUFFER_ID property for all outputs connected to this CRTC */
+            drmmode_crtc_update_output_fb_id(crtc);
         }
 
         drmModeAtomicFree(req);
@@ -958,6 +1017,11 @@ drmmode_crtc_set_mode(xf86CrtcPtr crtc, Bool test_only)
     }
 
     drmmode_set_ctm(crtc, ctm);
+
+    /* Update FRAMEBUFFER_ID property for all outputs connected to this CRTC */
+    if (ret == 0 && !test_only) {
+        drmmode_crtc_update_output_fb_id(crtc);
+    }
 
     free(output_ids);
     return ret;
@@ -3394,6 +3458,21 @@ drmmode_output_create_resources(xf86OutputPtr output)
             if (err != 0) {
                 xf86DrvMsg(output->scrn->scrnIndex, X_ERROR,
                            "RRChangeOutputProperty error, %d\n", err);
+            }
+        }
+    }
+
+    /* Create FRAMEBUFFER_ID property (will be updated when CRTC is enabled) */
+    {
+        Atom name = MakeAtom("FRAMEBUFFER_ID", strlen("FRAMEBUFFER_ID"), TRUE);
+        INT32 dummy = 0;
+
+        if (name != BAD_RESOURCE) {
+            err = RRConfigureOutputProperty(output->randr_output, name,
+                                            FALSE, FALSE, FALSE, 1, &dummy);
+            if (err != 0) {
+                xf86DrvMsg(output->scrn->scrnIndex, X_WARNING,
+                           "Failed to configure FRAMEBUFFER_ID property: %d\n", err);
             }
         }
     }
