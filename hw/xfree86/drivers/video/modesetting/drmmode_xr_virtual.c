@@ -37,6 +37,7 @@
 #include "xf86Crtc.h"
 #include "xf86RandR12.h"
 #include "randrstr.h"
+#include "randr/randrstr_priv.h"
 #include "xf86Modes.h"
 #include "xf86DDC.h"
 #include "drmmode_display.h"
