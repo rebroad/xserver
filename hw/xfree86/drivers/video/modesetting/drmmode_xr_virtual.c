@@ -62,7 +62,6 @@ extern const xf86CrtcFuncsRec drmmode_crtc_funcs;
 #define XR_HEIGHT_PROPERTY "XR_HEIGHT"
 #define XR_REFRESH_PROPERTY "XR_REFRESH"
 #define XR_FB_ID_PROPERTY "FRAMEBUFFER_ID"
-#define XR_PIXMAP_ID_PROPERTY "PIXMAP_ID"
 
 /* Structure to track a dynamically created virtual output */
 typedef struct _xr_virtual_output_rec {
@@ -94,7 +93,6 @@ static void drmmode_xr_destroy_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_
 #define XR_HEIGHT_ATOM() MakeAtom(XR_HEIGHT_PROPERTY, strlen(XR_HEIGHT_PROPERTY), TRUE)
 #define XR_REFRESH_ATOM() MakeAtom(XR_REFRESH_PROPERTY, strlen(XR_REFRESH_PROPERTY), TRUE)
 #define XR_FB_ID_ATOM() MakeAtom(XR_FB_ID_PROPERTY, strlen(XR_FB_ID_PROPERTY), TRUE)
-#define XR_PIXMAP_ID_ATOM() MakeAtom(XR_PIXMAP_ID_PROPERTY, strlen(XR_PIXMAP_ID_PROPERTY), TRUE)
 
 /* Find a virtual output by name */
 static xr_virtual_output_ptr
@@ -150,49 +148,6 @@ drmmode_xr_virtual_ensure_fb_id_property(ScrnInfoPtr pScrn, RROutputPtr randr_ou
                                    (unsigned char *)&fb_id, FALSE, FALSE);
     if (err != 0) {
         xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to set FRAMEBUFFER_ID property: %d\n", err);
-        return FALSE;
-    }
-
-    RRPostPendingProperties(randr_output);
-    return TRUE;
-}
-
-/* Create or ensure PIXMAP_ID property exists on a virtual output */
-static Bool
-drmmode_xr_virtual_ensure_pixmap_id_property(ScrnInfoPtr pScrn, RROutputPtr randr_output, PixmapPtr pixmap)
-{
-    Atom name = XR_PIXMAP_ID_ATOM();
-    INT32 dummy = 0;
-    int err;
-    uint32_t pixmap_id = 0;
-
-    if (!pixmap) {
-        /* No pixmap available - don't set property */
-        return FALSE;
-    }
-
-    pixmap_id = pixmap->drawable.id;
-
-    if (name == BAD_RESOURCE) {
-        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to create PIXMAP_ID atom\n");
-        return FALSE;
-    }
-
-    /* Check if property already exists */
-    if (!RRQueryOutputProperty(randr_output, name)) {
-        /* Property doesn't exist, create it */
-        err = RRConfigureOutputProperty(randr_output, name, FALSE, FALSE, FALSE, 1, &dummy);
-        if (err != 0) {
-            xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to configure PIXMAP_ID property: %d\n", err);
-            return FALSE;
-        }
-    }
-
-    /* Set/update the property value */
-    err = RRChangeOutputProperty(randr_output, name, XA_INTEGER, 32, PropModeReplace, 1,
-                                   (unsigned char *)&pixmap_id, FALSE, FALSE);
-    if (err != 0) {
-        xf86DrvMsg(pScrn->scrnIndex, X_WARNING, "Failed to set PIXMAP_ID property: %d\n", err);
         return FALSE;
     }
 
@@ -1589,16 +1544,14 @@ bo_created:
 pixmap_created:
     vout->pixmap = pixmap;
 
-    /* Set FRAMEBUFFER_ID and PIXMAP_ID properties on RandR output for renderer access */
+    /* Set FRAMEBUFFER_ID property on RandR output for renderer access */
     if (vout->randr_output) {
         drmmode_xr_virtual_ensure_fb_id_property(pScrn, vout->randr_output, vout->framebuffer_id);
-        drmmode_xr_virtual_ensure_pixmap_id_property(pScrn, vout->randr_output, pixmap);
     }
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Created off-screen framebuffer for '%s': %dx%d, FB ID %u, Pixmap ID %u\n",
-               vout->name, width, height, vout->framebuffer_id,
-               pixmap ? pixmap->drawable.id : 0);
+               "Created off-screen framebuffer for '%s': %dx%d, FB ID %u\n",
+               vout->name, width, height, vout->framebuffer_id);
 
     return TRUE;
 }
@@ -1684,10 +1637,9 @@ drmmode_xr_virtual_crtc_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
                                vout->name, new_width, new_height);
                     /* Continue anyway - mode change will still update CRTC state */
                 } else {
-                    /* Update FRAMEBUFFER_ID and PIXMAP_ID properties with new framebuffer/pixmap */
+                    /* Update FRAMEBUFFER_ID property with new framebuffer */
                     if (vout->randr_output) {
                         drmmode_xr_virtual_ensure_fb_id_property(pScrn, vout->randr_output, vout->framebuffer_id);
-                        drmmode_xr_virtual_ensure_pixmap_id_property(pScrn, vout->randr_output, vout->pixmap);
                     }
                     /* Update virtual output dimensions */
                     vout->width = new_width;
