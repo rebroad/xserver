@@ -659,6 +659,9 @@ RRConfigureOutputProperty(RROutputPtr output, Atom property,
                           Bool pending, Bool range, Bool immutable,
                           int num_values, const INT32 *values);
 
+extern _X_EXPORT RRPropertyPtr
+RRQueryOutputProperty(RROutputPtr output, Atom property);
+
 /* rrprovider.c */
 #define PRIME_SYNC_PROP         "PRIME Synchronization"
 

@@ -320,7 +320,7 @@ RRPostPendingProperties(RROutputPtr output)
     return ret;
 }
 
-RRPropertyPtr
+_X_EXPORT RRPropertyPtr
 RRQueryOutputProperty(RROutputPtr output, Atom property)
 {
     RRPropertyPtr prop;

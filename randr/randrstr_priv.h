@@ -324,8 +324,9 @@ void RRPointerScreenConfigured(ScreenPtr pScreen);
  * @param output    the output to query
  * @param property  Atom ID of the property to query
  * @return pointer to property structure, or NULL if not found
+ *
+ * Note: Declaration moved to randrstr.h (public API) - see there for declaration
  */
-RRPropertyPtr RRQueryOutputProperty(RROutputPtr output, Atom property);
 
 /*
  * Delete all properties on given output
