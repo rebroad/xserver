@@ -67,7 +67,6 @@ if cc.get_id() == 'gcc' or cc.get_id() == 'clang'
         '-Werror=address',
         '-Werror=int-to-pointer-cast',
         '-Werror=pointer-to-int-cast',
-        '-Werror=redundant-decls',
         '-Woverride-init',
         '-Wvla',
         '-Wincompatible-pointer-types',
