@@ -588,6 +588,12 @@ extern _X_EXPORT Bool
 extern _X_EXPORT Bool
  RRCrtcGammaSetSize(RRCrtcPtr crtc, int size);
 
+/*
+ * Destroy a Crtc at shutdown
+ */
+extern _X_EXPORT void
+ RRCrtcDestroy(RRCrtcPtr crtc);
+
 /* rrmode.c */
 /*
  * Find, and if necessary, create a mode

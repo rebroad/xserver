@@ -186,8 +186,8 @@ void RRDeliverCrtcEvent(ClientPtr pClient, WindowPtr pWin, RRCrtcPtr crtc);
  * Destroy a Crtc at shutdown
  *
  * @param crtc    the CRTC to destroy
+ * Note: Declared in randrstr.h (public API) for driver use
  */
-void RRCrtcDestroy(RRCrtcPtr crtc);
 
 /*
  * Initialize crtc resource type

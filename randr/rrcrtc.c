@@ -883,7 +883,7 @@ RRCrtcGetTransform(RRCrtcPtr crtc)
 /*
  * Destroy a Crtc at shutdown
  */
-void
+_X_EXPORT void
 RRCrtcDestroy(RRCrtcPtr crtc)
 {
     FreeResource(crtc->id, 0);
