@@ -373,8 +373,6 @@ void drmmode_crtc_set_vrr(xf86CrtcPtr crtc, Bool enabled);
 Bool drmmode_xr_virtual_output_init(ScrnInfoPtr pScrn, drmmode_ptr drmmode);
 Bool drmmode_xr_virtual_output_post_screen_init(ScrnInfoPtr pScrn);
 void drmmode_xr_virtual_output_fini(ScrnInfoPtr pScrn);
-Bool drmmode_xr_get_ar_mode(ScrnInfoPtr pScrn);
-Bool drmmode_xr_set_ar_mode(ScrnInfoPtr pScrn, Bool enabled);
 Bool drmmode_xr_add_mode(ScrnInfoPtr pScrn, int width, int height, int refresh);
 
 #endif

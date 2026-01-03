@@ -63,6 +63,7 @@ extern const xf86CrtcFuncsRec drmmode_crtc_funcs;
 #define XR_REFRESH_PROPERTY "XR_REFRESH" // TODO - used?
 #define XR_FB_ID_PROPERTY "FRAMEBUFFER_ID"
 #define XR_MODES_PROPERTY "XR_MODES"
+#define XR_VIRTUAL_OUTPUT_PROPERTY "VIRTUAL_OUTPUT"
 
 /* Structure to store a display mode */
 typedef struct _xr_mode_rec {
@@ -470,15 +471,8 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
         return NULL;
     }
 
-    /* Set connection based on AR mode state */
-    /* If AR mode is enabled, virtual outputs should be shown (connected)
-     * If AR mode is disabled, virtual outputs should be hidden (disconnected) */
-    if (ms->xr_ar_mode) {
-        RROutputSetConnection(output->randr_output, RR_Connected);
-    } else {
-        RROutputSetConnection(output->randr_output, RR_Disconnected);
-        output->status = XF86OutputStatusDisconnected;
-    }
+    /* Virtual outputs are always connected */
+    RROutputSetConnection(output->randr_output, RR_Connected);
 
     /* Set modes */
     drmmode_xr_virtual_set_modes(output, width, height, refresh);
@@ -548,6 +542,57 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
             /* Set output properties for CRTC assignment */
             output->possible_crtcs = 1 << (randr_crtc->id);
             output->possible_clones = 0;
+
+            /* Mark this output as virtual by setting VIRTUAL_OUTPUT property */
+            {
+                Atom virtual_atom = MakeAtom(XR_VIRTUAL_OUTPUT_PROPERTY,
+                                             strlen(XR_VIRTUAL_OUTPUT_PROPERTY), TRUE);
+                INT32 dummy = 0;
+                if (virtual_atom != BAD_RESOURCE) {
+                    if (!RRQueryOutputProperty(output->randr_output, virtual_atom)) {
+                        /* Property doesn't exist, create it */
+                        if (RRConfigureOutputProperty(output->randr_output, virtual_atom,
+                                                      FALSE, FALSE, FALSE, 1, &dummy) == 0) {
+                            /* Set the property value to 1 (true) */
+                            INT32 value = 1;
+                            RRChangeOutputProperty(output->randr_output, virtual_atom,
+                                                   XA_INTEGER, 32, PropModeReplace, 1,
+                                                   (unsigned char *)&value, FALSE, FALSE);
+                            RRPostPendingProperties(output->randr_output);
+                        }
+                    }
+                }
+            }
+
+            /* Enable the output automatically by setting a mode on the CRTC */
+            if (output->randr_output->numModes > 0) {
+                /* Find the preferred mode (the one matching width x height) */
+                RRModePtr preferred_mode = NULL;
+                for (int i = 0; i < output->randr_output->numModes; i++) {
+                    RRModePtr mode = output->randr_output->modes[i];
+                    if (mode && mode->mode.width == width && mode->mode.height == height) {
+                        preferred_mode = mode;
+                        break;
+                    }
+                }
+                /* If no exact match, use the first mode */
+                if (!preferred_mode) {
+                    preferred_mode = output->randr_output->modes[0];
+                }
+
+                if (preferred_mode) {
+                    /* Enable the CRTC with the preferred mode */
+                    if (RRCrtcNotify(randr_crtc, preferred_mode, 0, 0, RR_Rotate_0, NULL,
+                                     1, &output->randr_output)) {
+                        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                                   "Virtual XR output '%s' enabled automatically with mode %dx%d\n",
+                                   name, width, height);
+                    } else {
+                        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                                   "Failed to enable virtual XR output '%s' automatically\n", name);
+                    }
+                }
+            }
         } else {
             xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
                        "Failed to create RandR CRTC for virtual output '%s'\n", name);
@@ -1177,305 +1222,8 @@ drmmode_xr_virtual_output_fini(ScrnInfoPtr pScrn)
     }
 
     ms->xr_virtual_enabled = FALSE;
-    ms->xr_ar_mode = FALSE;
 }
 
-/**
- * Check if AR mode is enabled for a virtual XR connector
- */
-Bool
-drmmode_xr_get_ar_mode(ScrnInfoPtr pScrn)
-{
-    modesettingPtr ms = modesettingPTR(pScrn);
-    return ms->xr_ar_mode;
-}
-
-/**
- * Set AR mode for virtual XR connectors
- */
-/**
- * Check EDID descriptor strings for XR device identifiers
- * 
- * EDID descriptor blocks start at byte 54, each descriptor is 18 bytes.
- * Descriptors can be monitor name, serial number, etc.
- */
-static Bool
-drmmode_xr_check_edid_for_xr_device(drmModePropertyBlobPtr edid_blob)
-{
-    const unsigned char *edid;
-    int i, j;
-    char descriptor_text[14]; /* EDID descriptor text is 13 bytes + null terminator */
-    
-    if (!edid_blob || !edid_blob->data || edid_blob->length < 128)
-        return FALSE;
-    
-    edid = (const unsigned char *)edid_blob->data;
-    
-    /* Check EDID descriptor blocks (bytes 54-125, 4 descriptors of 18 bytes each) */
-    for (i = 54; i <= 108; i += 18) {
-        /* Descriptor type is at offset 3 within each descriptor */
-        if (edid[i] != 0 || edid[i + 1] != 0) /* Not a text descriptor */
-            continue;
-        
-        /* Extract descriptor text (bytes 5-17, 13 characters) */
-        memset(descriptor_text, 0, sizeof(descriptor_text));
-        for (j = 0; j < 13 && (i + 5 + j) < edid_blob->length; j++) {
-            char c = (char)edid[i + 5 + j];
-            if (c == '\n' || c == '\r')
-                break;
-            if (c >= 32 && c < 127) /* Printable ASCII */
-                descriptor_text[j] = c;
-        }
-        
-        /* Check for XR device identifiers (case-insensitive) */
-        if (strcasestr(descriptor_text, "XREAL") ||
-            strcasestr(descriptor_text, "VITURE") ||
-            strcasestr(descriptor_text, "nreal") ||  /* Older XREAL branding */
-            strcasestr(descriptor_text, "nReal")) {  /* Older XREAL branding variant */
-            return TRUE;
-        }
-    }
-    
-    return FALSE;
-}
-
-/**
- * Detect XR device from EDID and mark connector as non_desktop if detected
- */
-static Bool
-drmmode_xr_detect_and_mark_xr_output(ScrnInfoPtr pScrn, xf86OutputPtr output,
-                                      drmmode_output_private_ptr drmmode_output)
-{
-    drmmode_ptr drmmode = drmmode_output->drmmode;
-    drmModeConnectorPtr koutput = drmmode_output->mode_output;
-    drmModePropertyBlobPtr edid_blob = NULL;
-    Bool is_xr_device = FALSE;
-    int i;
-    
-    if (!koutput)
-        return FALSE;
-    
-    /* Get EDID blob if available */
-    if (drmmode_output->edid_blob) {
-        edid_blob = drmmode_output->edid_blob;
-    } else {
-        /* Try to get EDID blob directly from connector */
-        /* Replicate koutput_get_prop_blob logic (it's static in drmmode_display.c) */
-        for (i = 0; i < koutput->count_props; i++) {
-            drmModePropertyPtr prop = drmModeGetProperty(drmmode->fd, koutput->props[i]);
-            if (!prop)
-                continue;
-            
-            /* Check if property is BLOB type and named "EDID" */
-            if ((prop->flags & DRM_MODE_PROP_BLOB) && !strcmp(prop->name, "EDID")) {
-                edid_blob = drmModeGetPropertyBlob(drmmode->fd, koutput->prop_values[i]);
-                drmModeFreeProperty(prop);
-                break;
-            }
-            
-            drmModeFreeProperty(prop);
-        }
-    }
-    
-    /* Check EDID for XR device identifiers */
-    if (edid_blob) {
-        is_xr_device = drmmode_xr_check_edid_for_xr_device(edid_blob);
-        
-        /* Free EDID blob if we fetched it ourselves */
-        if (edid_blob != drmmode_output->edid_blob) {
-            drmModeFreePropertyBlob(edid_blob);
-        }
-    }
-    
-    /* Also check connector name as fallback (in case EDID is not available) */
-    if (!is_xr_device && output->name) {
-        const char *name_lower = output->name;
-        /* Simple check - look for XREAL/VITURE in connector name (case-insensitive via strcasestr) */
-        if (strcasestr(name_lower, "xreal") ||
-            strcasestr(name_lower, "viture") ||
-            strcasestr(name_lower, "nreal")) {
-            is_xr_device = TRUE;
-        }
-    }
-    
-    /* If detected as XR device, mark as non_desktop via DRM property */
-    if (is_xr_device) {
-        /* Find and set the non_desktop property on the connector */
-        for (i = 0; i < koutput->count_props; i++) {
-            drmModePropertyPtr prop = drmModeGetProperty(drmmode->fd, koutput->props[i]);
-            if (!prop)
-                continue;
-            
-            if (strcmp(prop->name, RR_PROPERTY_NON_DESKTOP) == 0) {
-                uint64_t value = 1; /* Set non_desktop to 1 (true) */
-                drmModeConnectorSetProperty(drmmode->fd, koutput->connector_id,
-                                          prop->prop_id, value);
-                output->non_desktop = TRUE;
-                xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                           "Detected XR device '%s' via EDID, marked as non_desktop\n",
-                           output->name);
-                drmModeFreeProperty(prop);
-                return TRUE;
-            }
-            
-            drmModeFreeProperty(prop);
-        }
-        
-        /* If property not found, still mark output as non_desktop in software */
-        output->non_desktop = TRUE;
-        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                   "Detected XR device '%s' via EDID, marked as non_desktop (property unavailable)\n",
-                   output->name);
-        return TRUE;
-    }
-    
-    return FALSE;
-}
-
-/**
- * Check if an output is a physical XR display
- * 
- * Detects XREAL/VITURE glasses via EDID descriptor strings and
- * marks them as non_desktop if detected.
- */
-static Bool
-drmmode_xr_is_physical_xr_output(xf86OutputPtr output)
-{
-    drmmode_output_private_ptr drmmode_output;
-    
-    if (!output || !output->driver_private)
-        return FALSE;
-    
-    drmmode_output = output->driver_private;
-    
-    /* Skip virtual outputs (they don't have DRM connector IDs) */
-    if (drmmode_output->output_id == 0 || drmmode_output->output_id == -1)
-        return FALSE;
-    
-    /* Skip XR-Manager output */
-    if (strcmp(output->name, XR_MANAGER_OUTPUT_NAME) == 0)
-        return FALSE;
-    
-    /* Skip virtual outputs (they are managed via VIRTUAL-MANAGER) */
-    /* Note: Virtual display names are arbitrary, not restricted to "XR-*" prefix */
-    /* We identify virtual outputs by checking if they're in the xr_virtual_outputs list */
-    /* For now, skip any output that starts with common virtual display prefixes */
-    /* This is a heuristic - proper detection would check the virtual outputs list */
-    if (output->name && (strncmp(output->name, "XR-", 3) == 0 ||
-                         strncmp(output->name, "REMOTE-", 7) == 0 ||
-                         strncmp(output->name, "STREAM-", 7) == 0 ||
-                         strncmp(output->name, "VIRTUAL-", 8) == 0))
-        return FALSE;
-    
-    /* Check if already marked as non_desktop (could be from previous detection or kernel) */
-    if (output->non_desktop)
-        return TRUE;
-    
-    /* Detect XR device from EDID and mark as non_desktop if found */
-    if (drmmode_xr_detect_and_mark_xr_output(output->scrn, output, drmmode_output))
-        return TRUE;
-    
-    return FALSE;
-}
-
-Bool
-drmmode_xr_set_ar_mode(ScrnInfoPtr pScrn, Bool enabled)
-{
-    modesettingPtr ms = modesettingPTR(pScrn);
-    xf86CrtcConfigPtr xf86_config = XF86_CRTC_CONFIG_PTR(pScrn);
-    xr_virtual_output_ptr vout;
-    ScreenPtr pScreen = xf86ScrnToScreen(pScrn);
-    int i;
-    Bool changed = FALSE;
-
-    if (ms->xr_ar_mode == enabled) {
-        /* Already in requested state, nothing to do */
-        return TRUE;
-    }
-
-    ms->xr_ar_mode = enabled;
-
-    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Setting AR mode to %s\n", enabled ? "enabled" : "disabled");
-
-    /* Iterate through all outputs and hide/show physical XR connectors */
-    for (i = 0; i < xf86_config->num_output; i++) {
-        xf86OutputPtr output = xf86_config->output[i];
-        
-        if (!output || !output->randr_output)
-            continue;
-        
-        /* Check if this is a physical XR output */
-        if (drmmode_xr_is_physical_xr_output(output)) {
-            if (enabled) {
-                /* AR mode enabled: hide physical XR connector */
-                if (output->randr_output->connection != RR_Disconnected) {
-                    RROutputSetConnection(output->randr_output, RR_Disconnected);
-                    output->status = XF86OutputStatusDisconnected;
-                    changed = TRUE;
-                    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                               "Hid physical XR output '%s' (AR mode enabled)\n",
-                               output->name);
-                }
-            } else {
-                /* AR mode disabled: show physical XR connector */
-                if (output->randr_output->connection != RR_Connected) {
-                    /* Restore connection status based on hardware state */
-                    if (output->funcs && output->funcs->detect) {
-                        output->status = (*output->funcs->detect)(output);
-                    } else {
-                        /* Fallback: assume connected if hardware output exists */
-                        output->status = XF86OutputStatusConnected;
-                    }
-                    if (output->status == XF86OutputStatusConnected) {
-                        RROutputSetConnection(output->randr_output, RR_Connected);
-                        changed = TRUE;
-                        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                                   "Showed physical XR output '%s' (AR mode disabled)\n",
-                                   output->name);
-                    }
-                }
-            }
-        }
-    }
-
-    /* Show/hide virtual XR outputs */
-    vout = ms->xr_virtual_outputs;
-    while (vout) {
-        if (vout->output && vout->randr_output) {
-            if (enabled) {
-                /* AR mode enabled: show virtual XR connector */
-                if (vout->randr_output->connection != RR_Connected) {
-                    RROutputSetConnection(vout->randr_output, RR_Connected);
-                    vout->output->status = XF86OutputStatusConnected;
-                    changed = TRUE;
-                    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                               "Showed virtual XR output '%s' (AR mode enabled)\n",
-                               vout->name);
-                }
-            } else {
-                /* AR mode disabled: hide virtual XR connector */
-                if (vout->randr_output->connection != RR_Disconnected) {
-                    RROutputSetConnection(vout->randr_output, RR_Disconnected);
-                    vout->output->status = XF86OutputStatusDisconnected;
-                    changed = TRUE;
-                    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                               "Hid virtual XR output '%s' (AR mode disabled)\n",
-                               vout->name);
-                }
-            }
-        }
-        vout = vout->next;
-    }
-
-    /* Notify RandR if anything changed */
-    if (changed && pScreen) {
-        RRSetChanged(pScreen);
-        RRTellChanged(pScreen);
-    }
-
-    return TRUE;
-}
 
 /* ============================================================
  * Off-screen Framebuffer Implementation
