@@ -58,20 +58,8 @@ extern const xf86CrtcFuncsRec drmmode_crtc_funcs;
 #define XR_MANAGER_OUTPUT_NAME "XR-Manager"
 #define CREATE_XR_OUTPUT_PROPERTY "CREATE_XR_OUTPUT"
 #define DELETE_XR_OUTPUT_PROPERTY "DELETE_XR_OUTPUT"
-#define XR_WIDTH_PROPERTY "XR_WIDTH" // TODO - used?
-#define XR_HEIGHT_PROPERTY "XR_HEIGHT" // TODO - used?
-#define XR_REFRESH_PROPERTY "XR_REFRESH" // TODO - used?
 #define XR_FB_ID_PROPERTY "FRAMEBUFFER_ID"
-#define XR_MODES_PROPERTY "XR_MODES"
 #define XR_VIRTUAL_OUTPUT_PROPERTY "VIRTUAL_OUTPUT"
-
-/* Structure to store a display mode */
-typedef struct _xr_mode_rec {
-    int width;
-    int height;
-    int refresh;
-    struct _xr_mode_rec *next;
-} xr_mode_rec, *xr_mode_ptr;
 
 /* Structure to track a dynamically created virtual output */
 typedef struct _xr_virtual_output_rec {
@@ -82,7 +70,6 @@ typedef struct _xr_virtual_output_rec {
     int width;                     /* Current width */
     int height;                    /* Current height */
     int refresh;                   /* Current refresh rate */
-    xr_mode_ptr modes;             /* List of supported modes */
     drmmode_bo framebuffer_bo;     /* Off-screen DRM buffer object for rendering */
     uint32_t framebuffer_id;       /* DRM framebuffer ID (for capture by renderer) */
     PixmapPtr pixmap;              /* X11 pixmap backed by framebuffer (for compositor) */
@@ -96,16 +83,12 @@ static Bool drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_p
                                                      int width, int height);
 static void drmmode_xr_destroy_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
                                                       xr_virtual_output_ptr vout);
-static void drmmode_xr_free_modes(xr_mode_ptr modes);
+static RRModePtr drmmode_xr_create_rrmode_from_displaymode(DisplayModePtr mode, const char *name);
 
 /* Get property atoms - use macros to avoid function call overhead */
 #define CREATE_XR_OUTPUT_ATOM() MakeAtom(CREATE_XR_OUTPUT_PROPERTY, strlen(CREATE_XR_OUTPUT_PROPERTY), TRUE)
 #define DELETE_XR_OUTPUT_ATOM() MakeAtom(DELETE_XR_OUTPUT_PROPERTY, strlen(DELETE_XR_OUTPUT_PROPERTY), TRUE)
-#define XR_WIDTH_ATOM() MakeAtom(XR_WIDTH_PROPERTY, strlen(XR_WIDTH_PROPERTY), TRUE)
-#define XR_HEIGHT_ATOM() MakeAtom(XR_HEIGHT_PROPERTY, strlen(XR_HEIGHT_PROPERTY), TRUE)
-#define XR_REFRESH_ATOM() MakeAtom(XR_REFRESH_PROPERTY, strlen(XR_REFRESH_PROPERTY), TRUE)
 #define XR_FB_ID_ATOM() MakeAtom(XR_FB_ID_PROPERTY, strlen(XR_FB_ID_PROPERTY), TRUE)
-#define XR_MODES_ATOM() MakeAtom(XR_MODES_PROPERTY, strlen(XR_MODES_PROPERTY), TRUE)
 
 /* Find a virtual output by name */
 static xr_virtual_output_ptr
@@ -210,7 +193,6 @@ drmmode_xr_virtual_output_destroy(xf86OutputPtr output)
             } else {
                 ms->xr_virtual_outputs = vout->next;
             }
-            drmmode_xr_free_modes(vout->modes);
             if (vout->name)
                 free(vout->name);
             free(vout);
@@ -240,21 +222,39 @@ drmmode_xr_virtual_output_funcs_init(void)
 }
 
 /**
- * Free mode list
+ * Convert a DisplayModePtr to an RRModePtr
+ * Helper function to avoid code duplication
  */
-static void
-drmmode_xr_free_modes(xr_mode_ptr modes)
+static RRModePtr
+drmmode_xr_create_rrmode_from_displaymode(DisplayModePtr mode, const char *name)
 {
-    while (modes) {
-        xr_mode_ptr next = modes->next;
-        free(modes);
-        modes = next;
-    }
+    xRRModeInfo modeInfo;
+    RRModePtr rrmode;
+
+    if (!mode || !name)
+        return NULL;
+
+    modeInfo.nameLength = strlen(name);
+    modeInfo.width = mode->HDisplay;
+    modeInfo.dotClock = mode->Clock * 1000;
+    modeInfo.hSyncStart = mode->HSyncStart;
+    modeInfo.hSyncEnd = mode->HSyncEnd;
+    modeInfo.hTotal = mode->HTotal;
+    modeInfo.hSkew = mode->HSkew;
+    modeInfo.height = mode->VDisplay;
+    modeInfo.vSyncStart = mode->VSyncStart;
+    modeInfo.vSyncEnd = mode->VSyncEnd;
+    modeInfo.vTotal = mode->VTotal;
+    modeInfo.modeFlags = mode->Flags;
+
+    rrmode = RRModeGet(&modeInfo, name);
+    return rrmode;
 }
 
 /**
  * Set modes for a virtual XR output by converting DisplayModePtr to RRModePtr
- * If vout->modes is set, uses those modes; otherwise creates common modes
+ * Creates a single mode matching the requested resolution
+ * When resizing, this function is called again and will replace the existing mode
  */
 static void
 drmmode_xr_virtual_set_modes(xf86OutputPtr output, int width, int height, int refresh)
@@ -262,133 +262,33 @@ drmmode_xr_virtual_set_modes(xf86OutputPtr output, int width, int height, int re
     if (!output->randr_output)
         return;
 
-    ScrnInfoPtr pScrn = output->scrn;
-    modesettingPtr ms = modesettingPTR(pScrn);
-    xr_virtual_output_ptr vout = NULL;
-
-    /* Find the virtual output record */
-    vout = ms->xr_virtual_outputs;
-    while (vout) {
-        if (vout->output == output)
-            break;
-        vout = vout->next;
-    }
-
     DisplayModePtr mode;
     RRModePtr *rrmodes = NULL;
     int nmode = 0;
     char mode_name[64];
 
-    /* If we have custom modes from TV receiver, use those */
-    if (vout && vout->modes) {
-        xr_mode_ptr mode_ptr = vout->modes;
-        while (mode_ptr) {
-            /* Create mode */
-            mode = xf86CVTMode(mode_ptr->width, mode_ptr->height, mode_ptr->refresh, FALSE, FALSE);
-            if (!mode) {
-                mode_ptr = mode_ptr->next;
-                continue;
-            }
+    /* Create the requested mode */
+    mode = xf86CVTMode(width, height, refresh, FALSE, FALSE);
+    if (mode) {
+        snprintf(mode_name, sizeof(mode_name), "%dx%d", width, height);
+        mode->name = XNFstrdup(mode_name);
+        mode->type = M_T_USERPREF | M_T_PREFERRED;
 
-            snprintf(mode_name, sizeof(mode_name), "%dx%d@%dHz",
-                     mode_ptr->width, mode_ptr->height, mode_ptr->refresh);
-            mode->name = XNFstrdup(mode_name);
-            mode->type = M_T_USERPREF;
-            if (mode_ptr->width == width && mode_ptr->height == height) {
-                mode->type |= M_T_PREFERRED;
-            }
-
-            /* Convert to RRMode */
-            {
-                xRRModeInfo modeInfo;
-                RRModePtr rrmode;
-
-                modeInfo.nameLength = strlen(mode->name);
-                modeInfo.width = mode->HDisplay;
-                modeInfo.dotClock = mode->Clock * 1000;
-                modeInfo.hSyncStart = mode->HSyncStart;
-                modeInfo.hSyncEnd = mode->HSyncEnd;
-                modeInfo.hTotal = mode->HTotal;
-                modeInfo.hSkew = mode->HSkew;
-                modeInfo.height = mode->VDisplay;
-                modeInfo.vSyncStart = mode->VSyncStart;
-                modeInfo.vSyncEnd = mode->VSyncEnd;
-                modeInfo.vTotal = mode->VTotal;
-                modeInfo.modeFlags = mode->Flags;
-
-                rrmode = RRModeGet(&modeInfo, mode->name);
-                if (rrmode) {
-                    RRModePtr *new_rrmodes = realloc(rrmodes, (nmode + 1) * sizeof(RRModePtr));
-                    if (new_rrmodes) {
-                        rrmodes = new_rrmodes;
-                        rrmodes[nmode] = rrmode;
-                        nmode++;
-                    }
-                }
-            }
-
-            xf86DeleteMode(&output->probed_modes, mode);
-            mode_ptr = mode_ptr->next;
-        }
-    } else {
-        /* Fallback: Create multiple common modes for virtual outputs */
-        /* This allows users to change resolution via standard RandR APIs */
-        int common_widths[] = {1920, 2560, 3840, 0};
-        int common_heights[] = {1080, 1440, 2160, 0};
-        int i, j;
-
-        for (i = 0; common_widths[i] != 0; i++) {
-            for (j = 0; common_heights[j] != 0; j++) {
-                int w = common_widths[i];
-                int h = common_heights[j];
-
-                /* Create mode */
-                mode = xf86CVTMode(w, h, refresh, FALSE, FALSE);
-                if (!mode)
-                    continue;
-
-                snprintf(mode_name, sizeof(mode_name), "%dx%d", w, h);
-                mode->name = XNFstrdup(mode_name);
-                mode->type = M_T_USERPREF;
-                if (w == width && h == height) {
-                    mode->type |= M_T_PREFERRED;
-                }
-
-                /* Convert to RRMode */
-                {
-                    xRRModeInfo modeInfo;
-                    RRModePtr rrmode;
-
-                    modeInfo.nameLength = strlen(mode->name);
-                    modeInfo.width = mode->HDisplay;
-                    modeInfo.dotClock = mode->Clock * 1000;
-                    modeInfo.hSyncStart = mode->HSyncStart;
-                    modeInfo.hSyncEnd = mode->HSyncEnd;
-                    modeInfo.hTotal = mode->HTotal;
-                    modeInfo.hSkew = mode->HSkew;
-                    modeInfo.height = mode->VDisplay;
-                    modeInfo.vSyncStart = mode->VSyncStart;
-                    modeInfo.vSyncEnd = mode->VSyncEnd;
-                    modeInfo.vTotal = mode->VTotal;
-                    modeInfo.modeFlags = mode->Flags;
-
-                    rrmode = RRModeGet(&modeInfo, mode->name);
-                    if (rrmode) {
-                        RRModePtr *new_rrmodes = realloc(rrmodes, (nmode + 1) * sizeof(RRModePtr));
-                        if (new_rrmodes) {
-                            rrmodes = new_rrmodes;
-                            rrmodes[nmode] = rrmode;
-                            nmode++;
-                        }
-                    }
-                }
-
-                xf86DeleteMode(&output->probed_modes, mode);
+        /* Convert to RRMode */
+        RRModePtr rrmode = drmmode_xr_create_rrmode_from_displaymode(mode, mode->name);
+        if (rrmode) {
+            rrmodes = realloc(rrmodes, sizeof(RRModePtr));
+            if (rrmodes) {
+                rrmodes[0] = rrmode;
+                nmode = 1;
             }
         }
+
+        xf86DeleteMode(&output->probed_modes, mode);
     }
 
     if (nmode > 0) {
+        /* Set the single mode (marked as preferred) */
         RROutputSetModes(output->randr_output, rrmodes, nmode, 1);
     }
 
@@ -477,45 +377,6 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     /* Set modes */
     drmmode_xr_virtual_set_modes(output, width, height, refresh);
 
-    /* Create resize properties */
-    {
-        Atom width_atom = XR_WIDTH_ATOM();
-        Atom height_atom = XR_HEIGHT_ATOM();
-        Atom refresh_atom = XR_REFRESH_ATOM();
-        INT32 width_val = width;
-        INT32 height_val = height;
-        INT32 refresh_val = refresh;
-
-        if (width_atom != BAD_RESOURCE) {
-            RRConfigureOutputProperty(output->randr_output, width_atom, FALSE, FALSE, FALSE, 1, &width_val);
-            RRChangeOutputProperty(output->randr_output, width_atom, XA_INTEGER, 32,
-                                   PropModeReplace, 1, &width_val, FALSE, FALSE);
-        }
-        if (height_atom != BAD_RESOURCE) {
-            RRConfigureOutputProperty(output->randr_output, height_atom, FALSE, FALSE, FALSE, 1, &height_val);
-            RRChangeOutputProperty(output->randr_output, height_atom, XA_INTEGER, 32,
-                                   PropModeReplace, 1, &height_val, FALSE, FALSE);
-        }
-        if (refresh_atom != BAD_RESOURCE) {
-            RRConfigureOutputProperty(output->randr_output, refresh_atom, FALSE, FALSE, FALSE, 1, &refresh_val);
-            RRChangeOutputProperty(output->randr_output, refresh_atom, XA_INTEGER, 32,
-                                   PropModeReplace, 1, &refresh_val, FALSE, FALSE);
-        }
-    }
-
-    /* Create XR_MODES property for setting custom modes */
-    {
-        Atom modes_atom = XR_MODES_ATOM();
-        if (modes_atom != BAD_RESOURCE) {
-            INT32 dummy = 0;
-            RRConfigureOutputProperty(output->randr_output, modes_atom, FALSE, FALSE, FALSE, 1, &dummy);
-            /* Initial empty value */
-            char empty_str[] = "";
-            RRChangeOutputProperty(output->randr_output, modes_atom, XA_STRING, 8,
-                                   PropModeReplace, 1, (unsigned char *)empty_str, FALSE, FALSE);
-        }
-    }
-
     RRPostPendingProperties(output->randr_output);
     RROutputChanged(output->randr_output, TRUE);
     RRTellChanged(pScreen);
@@ -563,36 +424,6 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
                     }
                 }
             }
-
-            /* Enable the output automatically by setting a mode on the CRTC */
-            if (output->randr_output->numModes > 0) {
-                /* Find the preferred mode (the one matching width x height) */
-                RRModePtr preferred_mode = NULL;
-                for (int i = 0; i < output->randr_output->numModes; i++) {
-                    RRModePtr mode = output->randr_output->modes[i];
-                    if (mode && mode->mode.width == width && mode->mode.height == height) {
-                        preferred_mode = mode;
-                        break;
-                    }
-                }
-                /* If no exact match, use the first mode */
-                if (!preferred_mode) {
-                    preferred_mode = output->randr_output->modes[0];
-                }
-
-                if (preferred_mode) {
-                    /* Enable the CRTC with the preferred mode */
-                    if (RRCrtcNotify(randr_crtc, preferred_mode, 0, 0, RR_Rotate_0, NULL,
-                                     1, &output->randr_output)) {
-                        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-                                   "Virtual XR output '%s' enabled automatically with mode %dx%d\n",
-                                   name, width, height);
-                    } else {
-                        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                                   "Failed to enable virtual XR output '%s' automatically\n", name);
-                    }
-                }
-            }
         } else {
             xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
                        "Failed to create RandR CRTC for virtual output '%s'\n", name);
@@ -620,7 +451,6 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     vout->width = width;
     vout->height = height;
     vout->refresh = refresh;
-    vout->modes = NULL;  /* Will be set via XR_MODES property if provided */
     
     /* Initialize framebuffer fields */
     memset(&vout->framebuffer_bo, 0, sizeof(vout->framebuffer_bo));
@@ -724,10 +554,9 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
         vout->output = NULL;
     }
 
-    /* Free name, modes, and record */
+    /* Free name and record */
     if (vout->name)
         free(vout->name);
-    drmmode_xr_free_modes(vout->modes);
     free(vout);
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
@@ -736,56 +565,6 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
     return TRUE;
 }
 
-/**
- * Resize a virtual XR output
- */
-static Bool
-drmmode_xr_resize_virtual_output(ScrnInfoPtr pScrn, xr_virtual_output_ptr vout,
-                                  int width, int height, int refresh)
-{
-    if (!vout || !vout->output || !vout->randr_output)
-        return FALSE;
-
-    /* Update dimensions */
-    vout->width = width;
-    vout->height = height;
-    vout->refresh = refresh;
-
-    /* Update modes */
-    drmmode_xr_virtual_set_modes(vout->output, width, height, refresh);
-
-    /* Update properties */
-    {
-        Atom width_atom = XR_WIDTH_ATOM();
-        Atom height_atom = XR_HEIGHT_ATOM();
-        Atom refresh_atom = XR_REFRESH_ATOM();
-        INT32 width_val = width;
-        INT32 height_val = height;
-        INT32 refresh_val = refresh;
-
-        if (width_atom != BAD_RESOURCE) {
-            RRChangeOutputProperty(vout->randr_output, width_atom, XA_INTEGER, 32,
-                                   PropModeReplace, 1, &width_val, FALSE, FALSE);
-        }
-        if (height_atom != BAD_RESOURCE) {
-            RRChangeOutputProperty(vout->randr_output, height_atom, XA_INTEGER, 32,
-                                   PropModeReplace, 1, &height_val, FALSE, FALSE);
-        }
-        if (refresh_atom != BAD_RESOURCE) {
-            RRChangeOutputProperty(vout->randr_output, refresh_atom, XA_INTEGER, 32,
-                                   PropModeReplace, 1, &refresh_val, FALSE, FALSE);
-        }
-    }
-
-    RROutputChanged(vout->randr_output, TRUE);
-    RRTellChanged(xf86ScrnToScreen(pScrn));
-
-    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Resized virtual XR output '%s' to %dx%d@%dHz\n",
-               vout->name, width, height, refresh);
-
-    return TRUE;
-}
 
 /**
  * Property handler for XR-Manager output (handles CREATE/DELETE commands)
@@ -888,12 +667,6 @@ drmmode_xr_virtual_set_property(xf86OutputPtr output, Atom property,
     ScrnInfoPtr pScrn = output->scrn;
     modesettingPtr ms = modesettingPTR(pScrn);
     xr_virtual_output_ptr vout;
-    const char *prop_name;
-    int new_width, new_height, new_refresh;
-
-    prop_name = NameForAtom(property);
-    if (!prop_name)
-        return FALSE;
 
     /* Find the virtual output record */
     vout = ms->xr_virtual_outputs;
@@ -906,77 +679,14 @@ drmmode_xr_virtual_set_property(xf86OutputPtr output, Atom property,
     if (!vout)
         return FALSE; /* Not a virtual output, let default handler deal with it */
 
-    /* Handle resize properties */
-    if (value->type != XA_INTEGER || value->format != 32 || value->size != 1) {
-        return FALSE;
-    }
-
-    new_width = vout->width;
-    new_height = vout->height;
-    new_refresh = vout->refresh;
-
-    if (strcmp(prop_name, XR_MODES_PROPERTY) == 0) {
-        /* Handle XR_MODES property - format: "WIDTH:HEIGHT:REFRESH|WIDTH:HEIGHT:REFRESH|..." */
-        if (value->type != XA_STRING || value->format != 8) {
-            xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                       "XR_MODES property must be STRING format\n");
-            return FALSE;
-        }
-
-        char *modes_str = strndup((char *)value->data, value->size);
-        if (!modes_str)
-            return FALSE;
-
-        /* Free existing modes */
-        drmmode_xr_free_modes(vout->modes);
-        vout->modes = NULL;
-
-        /* Parse modes string */
-        char *saveptr = NULL;
-        char *token = strtok_r(modes_str, "|", &saveptr);
-        while (token) {
-            int w = 0, h = 0, r = 60;
-            if (sscanf(token, "%d:%d:%d", &w, &h, &r) >= 2) {
-                if (w >= 64 && w <= 16384 && h >= 64 && h <= 16384 && r >= 1 && r <= 1000) {
-                    xr_mode_ptr mode = calloc(1, sizeof(xr_mode_rec));
-                    if (mode) {
-                        mode->width = w;
-                        mode->height = h;
-                        mode->refresh = r;
-                        mode->next = vout->modes;
-                        vout->modes = mode;
-                    }
-                }
-            }
-            token = strtok_r(NULL, "|", &saveptr);
-        }
-        free(modes_str);
-
-        /* Re-set modes with the new mode list */
-        drmmode_xr_virtual_set_modes(vout->output, vout->width, vout->height, vout->refresh);
-        return TRUE;
-    } else if (strcmp(prop_name, XR_WIDTH_PROPERTY) == 0) {
-        new_width = *(INT32 *)value->data;
-    } else if (strcmp(prop_name, XR_HEIGHT_PROPERTY) == 0) {
-        new_height = *(INT32 *)value->data;
-    } else if (strcmp(prop_name, XR_REFRESH_PROPERTY) == 0) {
-        new_refresh = *(INT32 *)value->data;
-    } else {
-        return FALSE; /* Not a resize property */
-    }
-
-    /* Validate dimensions */
-    if (new_width < 64 || new_width > 16384 ||
-        new_height < 64 || new_height > 16384 ||
-        new_refresh < 1 || new_refresh > 1000) {
-        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
-                   "Invalid dimensions/refresh for XR output '%s': %dx%d@%dHz\n",
-                   vout->name, new_width, new_height, new_refresh);
-        return FALSE;
-    }
-
-    /* Apply resize */
-    return drmmode_xr_resize_virtual_output(pScrn, vout, new_width, new_height, new_refresh);
+    /* Virtual outputs use standard RandR mode setting for resizing.
+     * Users should create a new mode and set it via xrandr:
+     *   xrandr --newmode "1920x1080" ...
+     *   xrandr --output XR-0 --addmode "1920x1080"
+     *   xrandr --output XR-0 --mode "1920x1080"
+     * The CRTC's set_mode_major function will handle framebuffer resizing.
+     */
+    return FALSE; /* Let default handler deal with unknown properties */
 }
 
 /**
@@ -1198,7 +908,6 @@ drmmode_xr_virtual_output_fini(ScrnInfoPtr pScrn)
         }
         if (vout->name)
             free(vout->name);
-        drmmode_xr_free_modes(vout->modes);
         free(vout);
         vout = next;
     }
