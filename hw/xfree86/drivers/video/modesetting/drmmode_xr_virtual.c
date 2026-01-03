@@ -43,6 +43,7 @@
 #include "xf86DDC.h"
 #include "drmmode_display.h"
 #include "driver.h"
+#include "os.h"  /* For TimerSet, TimerCancel, TimerFree, GetTimeInMillis */
 #ifdef GLAMOR_HAS_GBM
 #define GLAMOR_FOR_XORG 1
 #include "glamor.h"
@@ -74,6 +75,8 @@ typedef struct _xr_virtual_output_rec {
     drmmode_bo framebuffer_bo;     /* Off-screen DRM buffer object for rendering */
     uint32_t framebuffer_id;       /* DRM framebuffer ID (for capture by renderer) */
     PixmapPtr pixmap;              /* X11 pixmap backed by framebuffer (for compositor) */
+    CARD32 last_access_time;       /* Last time framebuffer was accessed (milliseconds) */
+    OsTimerPtr inactivity_timer;   /* Timer to detect inactivity and disable DPMS */
     struct _xr_virtual_output_rec *next;  /* Linked list */
 } xr_virtual_output_rec, *xr_virtual_output_ptr;
 
@@ -85,6 +88,8 @@ static Bool drmmode_xr_create_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_p
 static void drmmode_xr_destroy_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
                                                       xr_virtual_output_ptr vout);
 static RRModePtr drmmode_xr_create_rrmode_from_displaymode(DisplayModePtr mode, const char *name);
+static void drmmode_xr_mark_output_active(xr_virtual_output_ptr vout);
+static CARD32 drmmode_xr_inactivity_timer_callback(OsTimerPtr timer, CARD32 now, void *arg);
 
 /* Get property atoms - use macros to avoid function call overhead */
 #define CREATE_XR_OUTPUT_ATOM() MakeAtom(CREATE_XR_OUTPUT_PROPERTY, strlen(CREATE_XR_OUTPUT_PROPERTY), TRUE)
@@ -111,6 +116,19 @@ drmmode_xr_find_virtual_output_by_crtc(modesettingPtr ms, xf86CrtcPtr crtc)
     xr_virtual_output_ptr vout = ms->xr_virtual_outputs;
     while (vout) {
         if (vout->crtc == crtc)
+            return vout;
+        vout = vout->next;
+    }
+    return NULL;
+}
+
+/* Find a virtual output by xf86OutputPtr */
+static xr_virtual_output_ptr
+drmmode_xr_find_virtual_output_by_output(modesettingPtr ms, xf86OutputPtr output)
+{
+    xr_virtual_output_ptr vout = ms->xr_virtual_outputs;
+    while (vout) {
+        if (vout->output == output)
             return vout;
         vout = vout->next;
     }
@@ -159,6 +177,121 @@ drmmode_xr_virtual_create_resources(xf86OutputPtr output)
     /* Virtual output doesn't need DRM-specific properties */
 }
 
+/* Get property callback - detects when FRAMEBUFFER_ID is queried (indicating active consumption) */
+static Bool
+drmmode_xr_virtual_output_get_property(xf86OutputPtr output, Atom property)
+{
+    modesettingPtr ms = modesettingPTR(output->scrn);
+    xr_virtual_output_ptr vout;
+    Atom fb_id_atom = XR_FB_ID_ATOM();
+
+    /* Check if this is the FRAMEBUFFER_ID property being queried */
+    if (property == fb_id_atom && fb_id_atom != BAD_RESOURCE) {
+        /* Find the virtual output */
+        vout = drmmode_xr_find_virtual_output_by_output(ms, output);
+        if (vout) {
+            /* Mark output as actively consumed */
+            drmmode_xr_mark_output_active(vout);
+        }
+    }
+
+    return TRUE;
+}
+
+/* Mark output as actively consumed - enable DPMS and reset inactivity timer */
+/*
+ * This is called when FRAMEBUFFER_ID property is queried, serving as a keep-alive signal.
+ * Consumers should periodically query this property (e.g., every 1-2 seconds) while
+ * actively streaming to keep the output active. This is a lightweight operation that
+ * requires minimal processing - just a property read via X11 protocol.
+ */
+static void
+drmmode_xr_mark_output_active(xr_virtual_output_ptr vout)
+{
+    if (!vout || !vout->output || !vout->crtc)
+        return;
+
+    CARD32 now = GetTimeInMillis();
+    CARD32 last_access = vout->last_access_time;
+    vout->last_access_time = now;
+
+    /* If output was inactive (no recent access), enable DPMS */
+    if (last_access == 0 || (now - last_access) > 5000) {  /* 5 second threshold */
+        xf86CrtcPtr crtc = vout->crtc;
+        drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+
+        /* Enable DPMS if currently not On */
+        if (drmmode_crtc->dpms_mode != DPMSModeOn) {
+            xf86DrvMsg(vout->output->scrn->scrnIndex, X_INFO,
+                       "Virtual output '%s' keep-alive received - enabling DPMS\n",
+                       vout->name);
+            if (crtc->funcs && crtc->funcs->dpms) {
+                crtc->funcs->dpms(crtc, DPMSModeOn);
+            }
+            if (vout->output->funcs && vout->output->funcs->dpms) {
+                vout->output->funcs->dpms(vout->output, DPMSModeOn);
+            }
+        }
+    }
+
+    /* Reset inactivity timer - check again in 1 second */
+    if (vout->inactivity_timer) {
+        TimerCancel(vout->inactivity_timer);
+    }
+    vout->inactivity_timer = TimerSet(vout->inactivity_timer, 0, 1000,
+                                      drmmode_xr_inactivity_timer_callback, vout);
+}
+
+/* Inactivity timer callback - disables DPMS if no keep-alive received */
+/*
+ * Keep-alive mechanism: Consumers can periodically query the FRAMEBUFFER_ID property
+ * (via RRGetOutputProperty) as a lightweight keep-alive signal. This is more efficient
+ * than the server polling drmModeGetFB, as it requires minimal processing on both sides.
+ *
+ * Benefits of Standby mode for virtual displays:
+ * 1. GPU power savings: Hardware CRTC is disabled, reducing GPU power consumption
+ * 2. Reduced compositing overhead: X server can skip compositing to inactive framebuffers
+ * 3. Memory bandwidth: Less memory bandwidth used for scanout operations
+ * 4. CPU savings: Less work for the compositor when outputs are inactive
+ *
+ * Note: The framebuffer can still be read via DMA-BUF even when CRTC is in Standby,
+ * but the GPU won't actively scan it out or composite to it.
+ */
+static CARD32
+drmmode_xr_inactivity_timer_callback(OsTimerPtr timer, CARD32 now, void *arg)
+{
+    xr_virtual_output_ptr vout = (xr_virtual_output_ptr)arg;
+    if (!vout || !vout->output || !vout->crtc)
+        return 0;  /* Stop timer */
+
+    CARD32 time_since_access = now - vout->last_access_time;
+
+    /* If no keep-alive (property query) received for 5 seconds, disable DPMS */
+    if (time_since_access >= 5000) {
+        xf86CrtcPtr crtc = vout->crtc;
+        drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+
+        /* Disable DPMS if currently On */
+        if (drmmode_crtc->dpms_mode == DPMSModeOn) {
+            xf86DrvMsg(vout->output->scrn->scrnIndex, X_INFO,
+                       "Virtual output '%s' inactive for %d ms (no keep-alive) - disabling DPMS\n",
+                       vout->name, time_since_access);
+            if (crtc->funcs && crtc->funcs->dpms) {
+                crtc->funcs->dpms(crtc, DPMSModeStandby);
+            }
+            if (vout->output->funcs && vout->output->funcs->dpms) {
+                vout->output->funcs->dpms(vout->output, DPMSModeStandby);
+            }
+        }
+
+        /* Stop timer - will be restarted if framebuffer is accessed again */
+        return 0;
+    }
+
+    /* Not enough time has passed - check again in 1 second */
+    return 1000;
+}
+
 /* Custom function table for virtual XR output - initialized at runtime */
 static xf86OutputFuncsRec drmmode_xr_virtual_output_funcs;
 
@@ -193,6 +326,12 @@ drmmode_xr_virtual_output_destroy(xf86OutputPtr output)
                 prev->next = vout->next;
             } else {
                 ms->xr_virtual_outputs = vout->next;
+            }
+            /* Cancel inactivity timer if active */
+            if (vout->inactivity_timer) {
+                TimerCancel(vout->inactivity_timer);
+                TimerFree(vout->inactivity_timer);
+                vout->inactivity_timer = NULL;
             }
             if (vout->name)
                 free(vout->name);
@@ -231,12 +370,15 @@ drmmode_xr_virtual_output_dpms(xf86OutputPtr output, int mode)
 static void
 drmmode_xr_virtual_output_funcs_init(void)
 {
-    /* Copy from the regular output funcs, but override create_resources, destroy, detect, and dpms */
+    /* Copy from the regular output funcs, but override create_resources, destroy, detect, dpms, and get_property */
     drmmode_xr_virtual_output_funcs = drmmode_output_funcs;
     drmmode_xr_virtual_output_funcs.create_resources = drmmode_xr_virtual_create_resources;
     drmmode_xr_virtual_output_funcs.destroy = drmmode_xr_virtual_output_destroy;
     drmmode_xr_virtual_output_funcs.detect = drmmode_xr_virtual_output_detect;
     drmmode_xr_virtual_output_funcs.dpms = drmmode_xr_virtual_output_dpms;
+#ifdef RANDR_13_INTERFACE
+    drmmode_xr_virtual_output_funcs.get_property = drmmode_xr_virtual_output_get_property;
+#endif
 }
 
 /**
@@ -475,6 +617,10 @@ drmmode_xr_create_virtual_output(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
     vout->framebuffer_id = 0;
     vout->pixmap = NULL;
 
+    /* Initialize access tracking - start inactive (DPMS Standby) */
+    vout->last_access_time = 0;
+    vout->inactivity_timer = NULL;
+
     /* Create off-screen framebuffer for this virtual output */
     if (!drmmode_xr_create_offscreen_framebuffer(pScrn, drmmode, vout,
                                                  width, height)) {
@@ -540,17 +686,27 @@ drmmode_xr_delete_virtual_output(ScrnInfoPtr pScrn, const char *name)
     /* Clean up CRTC if assigned */
     if (vout->crtc) {
         xf86CrtcPtr crtc = vout->crtc;
-        /* Destroy RandR CRTC if it exists */
+
+        /* Disable CRTC first (DPMS off) to clean up any active operations */
+        /* This ensures Present extension and other subsystems are notified */
+        if (crtc->funcs && crtc->funcs->dpms) {
+            crtc->funcs->dpms(crtc, DPMSModeOff);
+        }
+
+        /* Clear output->crtc reference before destroying CRTC */
+        if (vout->output) {
+            vout->output->crtc = NULL;
+        }
+
+        /* Destroy RandR CRTC if it exists (this will notify Present extension) */
         if (crtc->randr_crtc) {
             RRCrtcDestroy(crtc->randr_crtc);
             crtc->randr_crtc = NULL;
         }
-        /* Destroy XF86 CRTC */
+
+        /* Destroy XF86 CRTC (this will call our destroy function to free driver_private) */
         xf86CrtcDestroy(crtc);
         vout->crtc = NULL;
-        if (vout->output) {
-            vout->output->crtc = NULL;
-        }
     }
 
     /* Destroy RandR output first (before xf86Output) */
@@ -1474,8 +1630,16 @@ drmmode_xr_virtual_crtc_gamma_set(xf86CrtcPtr crtc,
 static void
 drmmode_xr_virtual_crtc_destroy(xf86CrtcPtr crtc)
 {
+    drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+
     /* Virtual CRTCs don't have hardware resources to free */
-    /* The driver_private will be freed by xf86CrtcDestroy */
+    /* But we need to free driver_private here (xf86CrtcDestroy doesn't do it) */
+    if (drmmode_crtc) {
+        /* Virtual CRTCs use fixed-size lut arrays (lut_r/g/b), not pointers, so nothing to free there */
+        /* Just free the driver_private structure itself */
+        free(drmmode_crtc);
+        crtc->driver_private = NULL;
+    }
 }
 
 static Bool

@@ -108,6 +108,10 @@ xf86_crtc_on(xf86CrtcPtr crtc)
 {
     drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
 
+    /* CRTC may have been destroyed but still referenced - check for NULL */
+    if (!drmmode_crtc)
+        return FALSE;
+
     return crtc->enabled && drmmode_crtc->dpms_mode == DPMSModeOn;
 }
 
@@ -231,6 +235,10 @@ ms_get_kernel_ust_msc(xf86CrtcPtr crtc,
     drmVBlank vbl;
     int ret;
 
+    /* CRTC may have been destroyed but still referenced - check for NULL */
+    if (!drmmode_crtc || !drmmode_crtc->mode_crtc)
+        return FALSE;
+
     if (ms->has_queue_sequence || !ms->tried_queue_sequence) {
         uint64_t ns;
         ms->tried_queue_sequence = TRUE;
@@ -282,8 +290,11 @@ ms_drm_set_seq_queued(uint32_t seq, uint64_t msc)
     xorg_list_for_each_entry(q, &ms_drm_queue, list) {
         if (q->seq == seq) {
             drmmode_crtc = q->crtc->driver_private;
-            if (msc < drmmode_crtc->next_msc)
-                drmmode_crtc->next_msc = msc;
+            /* CRTC may have been destroyed but still referenced - check for NULL */
+            if (drmmode_crtc) {
+                if (msc < drmmode_crtc->next_msc)
+                    drmmode_crtc->next_msc = msc;
+            }
             q->msc = msc;
             q->kernel_queued = TRUE;
             break;
@@ -313,6 +324,10 @@ ms_queue_vblank(xf86CrtcPtr crtc, ms_queue_flag flags,
     ScrnInfoPtr scrn = xf86ScreenToScrn(screen);
     modesettingPtr ms = modesettingPTR(scrn);
     drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+
+    /* CRTC may have been destroyed but still referenced - check for NULL */
+    if (!drmmode_crtc || !drmmode_crtc->mode_crtc)
+        return FALSE;
     drmVBlank vbl;
     int ret;
 
@@ -385,6 +400,10 @@ uint64_t
 ms_kernel_msc_to_crtc_msc(xf86CrtcPtr crtc, uint64_t sequence, Bool is64bit)
 {
     drmmode_crtc_private_rec *drmmode_crtc = crtc->driver_private;
+
+    /* CRTC may have been destroyed but still referenced - check for NULL */
+    if (!drmmode_crtc)
+        return 0;
 
     if (!is64bit) {
         /* sequence is provided as a 32 bit value from one of the 32 bit apis,
