@@ -25,6 +25,7 @@
 #endif
 
 #include <X11/Xatom.h>
+#include <X11/extensions/dpmsconst.h>
 #include <xf86drm.h>
 #include <string.h>
 #include <stdlib.h>
@@ -210,15 +211,32 @@ drmmode_xr_virtual_output_destroy(xf86OutputPtr output)
     output->driver_private = NULL;
 }
 
+/* DPMS function for virtual outputs - delegates to CRTC */
+static void
+drmmode_xr_virtual_output_dpms(xf86OutputPtr output, int mode)
+{
+    drmmode_output_private_ptr drmmode_output = output->driver_private;
+    xf86CrtcPtr crtc = output->crtc;
+
+    /* Track DPMS state */
+    drmmode_output->dpms = mode;
+
+    /* Delegate to CRTC DPMS (which handles hardware CRTC disabling) */
+    if (crtc && crtc->funcs && crtc->funcs->dpms) {
+        crtc->funcs->dpms(crtc, mode);
+    }
+}
+
 /* Initialize the virtual output function table (called once) */
 static void
 drmmode_xr_virtual_output_funcs_init(void)
 {
-    /* Copy from the regular output funcs, but override create_resources, destroy, and detect */
+    /* Copy from the regular output funcs, but override create_resources, destroy, detect, and dpms */
     drmmode_xr_virtual_output_funcs = drmmode_output_funcs;
     drmmode_xr_virtual_output_funcs.create_resources = drmmode_xr_virtual_create_resources;
     drmmode_xr_virtual_output_funcs.destroy = drmmode_xr_virtual_output_destroy;
     drmmode_xr_virtual_output_funcs.detect = drmmode_xr_virtual_output_detect;
+    drmmode_xr_virtual_output_funcs.dpms = drmmode_xr_virtual_output_dpms;
 }
 
 /**
@@ -1225,9 +1243,86 @@ drmmode_xr_destroy_offscreen_framebuffer(ScrnInfoPtr pScrn, drmmode_ptr drmmode,
 static void
 drmmode_xr_virtual_crtc_dpms(xf86CrtcPtr crtc, int mode)
 {
-    /* Virtual CRTCs don't need DPMS - just track state */
     drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+    modesettingPtr ms = modesettingPTR(crtc->scrn);
+    drmmode_ptr drmmode = drmmode_crtc->drmmode;
+    xr_virtual_output_ptr vout;
+
+    /* Track DPMS state */
     drmmode_crtc->dpms_mode = mode;
+
+    /* If using a hardware CRTC, disable it when DPMS is not On */
+    if (drmmode_crtc->mode_crtc) {
+        if (mode != DPMSModeOn) {
+            /* Disable hardware CRTC to save power when not actively consumed */
+            /* Use the same approach as drmmode_crtc_disable */
+            if (ms->atomic_modeset) {
+                drmModeAtomicReq *req = drmModeAtomicAlloc();
+                if (req) {
+                    drmmode_prop_info_ptr active_prop = &drmmode_crtc->props[DRMMODE_CRTC_ACTIVE];
+                    drmmode_prop_info_ptr mode_prop = &drmmode_crtc->props[DRMMODE_CRTC_MODE_ID];
+                    if (active_prop->prop_id)
+                        drmModeAtomicAddProperty(req, drmmode_crtc->mode_crtc->crtc_id,
+                                                 active_prop->prop_id, 0);
+                    if (mode_prop->prop_id)
+                        drmModeAtomicAddProperty(req, drmmode_crtc->mode_crtc->crtc_id,
+                                                 mode_prop->prop_id, 0);
+                    drmModeAtomicCommit(ms->fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+                    drmModeAtomicFree(req);
+                }
+            } else {
+                /* Non-atomic: disable CRTC */
+                drmModeSetCrtc(drmmode->fd, drmmode_crtc->mode_crtc->crtc_id,
+                              0, 0, 0, NULL, 0, NULL);
+            }
+            xf86DrvMsg(crtc->scrn->scrnIndex, X_INFO,
+                       "Disabled hardware CRTC %d for virtual output (DPMS %s)\n",
+                       drmmode_crtc->mode_crtc->crtc_id,
+                       mode == DPMSModeStandby ? "Standby" :
+                       mode == DPMSModeSuspend ? "Suspend" : "Off");
+        } else {
+            /* Re-enable hardware CRTC - need to reconfigure it */
+            vout = drmmode_xr_find_virtual_output_by_crtc(ms, crtc);
+            if (vout && vout->framebuffer_id != 0 && crtc->mode.HDisplay > 0) {
+                drmModeModeInfo kmode;
+                int ret;
+
+                /* Convert DisplayMode to DRM mode */
+                memset(&kmode, 0, sizeof(kmode));
+                kmode.clock = crtc->mode.Clock;
+                kmode.hdisplay = crtc->mode.HDisplay;
+                kmode.hsync_start = crtc->mode.HSyncStart;
+                kmode.hsync_end = crtc->mode.HSyncEnd;
+                kmode.htotal = crtc->mode.HTotal;
+                kmode.hskew = crtc->mode.HSkew;
+                kmode.vdisplay = crtc->mode.VDisplay;
+                kmode.vsync_start = crtc->mode.VSyncStart;
+                kmode.vsync_end = crtc->mode.VSyncEnd;
+                kmode.vtotal = crtc->mode.VTotal;
+                kmode.vscan = crtc->mode.VScan;
+                kmode.flags = crtc->mode.Flags;
+                if (crtc->mode.name) {
+                    strncpy(kmode.name, crtc->mode.name, DRM_DISPLAY_MODE_LEN - 1);
+                    kmode.name[DRM_DISPLAY_MODE_LEN - 1] = 0;
+                }
+                kmode.type = DRM_MODE_TYPE_USERDEF;
+
+                /* Re-enable CRTC to scan out to our off-screen framebuffer */
+                ret = drmModeSetCrtc(drmmode->fd, drmmode_crtc->mode_crtc->crtc_id,
+                                     vout->framebuffer_id, crtc->x, crtc->y, NULL, 0, &kmode);
+                if (ret) {
+                    xf86DrvMsg(crtc->scrn->scrnIndex, X_WARNING,
+                               "Failed to re-enable hardware CRTC %d for virtual output '%s': %s\n",
+                               drmmode_crtc->mode_crtc->crtc_id, vout->name, strerror(errno));
+                } else {
+                    xf86DrvMsg(crtc->scrn->scrnIndex, X_INFO,
+                               "Re-enabled hardware CRTC %d for virtual output '%s'\n",
+                               drmmode_crtc->mode_crtc->crtc_id, vout->name);
+                }
+            }
+        }
+    }
+    /* For virtual CRTCs (no hardware), just track state - no power savings needed */
 }
 
 static Bool
@@ -1237,10 +1332,10 @@ drmmode_xr_virtual_crtc_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
     ScrnInfoPtr pScrn = crtc->scrn;
     modesettingPtr ms = modesettingPTR(pScrn);
     drmmode_ptr drmmode = &ms->drmmode;
+    drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
     xr_virtual_output_ptr vout;
     int new_width, new_height;
 
-    /* Virtual CRTCs just update internal state - no hardware programming */
     if (mode) {
         new_width = mode->HDisplay;
         new_height = mode->VDisplay;
@@ -1273,6 +1368,47 @@ drmmode_xr_virtual_crtc_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
                     /* Update virtual output dimensions */
                     vout->width = new_width;
                     vout->height = new_height;
+                }
+            }
+
+            /* If using a hardware CRTC, configure it to scan out to our off-screen framebuffer */
+            if (drmmode_crtc->mode_crtc && vout->framebuffer_id != 0) {
+                /* Use hardware CRTC - configure it to scan out to our off-screen framebuffer */
+                drmModeModeInfo kmode;
+                int ret;
+
+                /* Convert DisplayMode to DRM mode (inline conversion) */
+                memset(&kmode, 0, sizeof(kmode));
+                kmode.clock = mode->Clock;
+                kmode.hdisplay = mode->HDisplay;
+                kmode.hsync_start = mode->HSyncStart;
+                kmode.hsync_end = mode->HSyncEnd;
+                kmode.htotal = mode->HTotal;
+                kmode.hskew = mode->HSkew;
+                kmode.vdisplay = mode->VDisplay;
+                kmode.vsync_start = mode->VSyncStart;
+                kmode.vsync_end = mode->VSyncEnd;
+                kmode.vtotal = mode->VTotal;
+                kmode.vscan = mode->VScan;
+                kmode.flags = mode->Flags;
+                if (mode->name) {
+                    strncpy(kmode.name, mode->name, DRM_DISPLAY_MODE_LEN - 1);
+                    kmode.name[DRM_DISPLAY_MODE_LEN - 1] = 0;
+                }
+                kmode.type = DRM_MODE_TYPE_USERDEF;
+
+                /* Set CRTC to scan out to our off-screen framebuffer (no outputs) */
+                ret = drmModeSetCrtc(drmmode->fd, drmmode_crtc->mode_crtc->crtc_id,
+                                     vout->framebuffer_id, x, y, NULL, 0, &kmode);
+                if (ret) {
+                    xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                               "Failed to configure hardware CRTC for virtual output '%s': %s\n",
+                               vout->name, strerror(errno));
+                    /* Fall through to update state anyway */
+                } else {
+                    xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                               "Configured hardware CRTC %d to scan out to virtual output '%s' framebuffer\n",
+                               drmmode_crtc->mode_crtc->crtc_id, vout->name);
                 }
             }
         }
@@ -1393,17 +1529,72 @@ static const xf86CrtcFuncsRec drmmode_xr_virtual_crtc_funcs = {
 };
 
 /**
- * Create a virtual CRTC for virtual XR outputs
- * Virtual CRTCs are software-based and don't have real DRM CRTCs
+ * Find an unused hardware CRTC that can be used for virtual XR outputs
+ * Returns NULL if no unused CRTC is available
+ */
+static xf86CrtcPtr
+drmmode_xr_find_unused_hw_crtc(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
+{
+    xf86CrtcConfigPtr config = XF86_CRTC_CONFIG_PTR(pScrn);
+    int c, o;
+    xf86CrtcPtr unused_crtc = NULL;
+
+    /* Look through all initialized CRTCs for one that's not in use */
+    for (c = 0; c < config->num_crtc; c++) {
+        xf86CrtcPtr crtc = config->crtc[c];
+        drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+
+        /* Skip if this CRTC doesn't have a real DRM CRTC (it's already virtual) */
+        if (!drmmode_crtc->mode_crtc)
+            continue;
+
+        /* Skip if CRTC is enabled */
+        if (crtc->enabled)
+            continue;
+
+        /* Check if any output is assigned to this CRTC */
+        for (o = 0; o < config->num_output; o++) {
+            if (config->output[o]->crtc == crtc)
+                break;
+        }
+
+        /* If we didn't find any output assigned to this CRTC, it's unused */
+        if (o == config->num_output) {
+            unused_crtc = crtc;
+            break;
+        }
+    }
+
+    if (unused_crtc) {
+        drmmode_crtc_private_ptr drmmode_crtc = unused_crtc->driver_private;
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                   "Found unused hardware CRTC (ID: %d) for virtual XR output\n",
+                   drmmode_crtc->mode_crtc->crtc_id);
+    }
+
+    return unused_crtc;
+}
+
+/**
+ * Create a CRTC for virtual XR outputs
+ * Tries to use an unused hardware CRTC first, falls back to virtual CRTC if none available
  */
 static xf86CrtcPtr
 drmmode_xr_create_virtual_crtc(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
 {
     xf86CrtcPtr crtc;
     drmmode_crtc_private_ptr drmmode_crtc;
-    (void)drmmode;  /* unused for now */
 
-    /* Create the CRTC using virtual function table */
+    /* First, try to find an unused hardware CRTC */
+    crtc = drmmode_xr_find_unused_hw_crtc(pScrn, drmmode);
+    if (crtc) {
+        /* Use the existing hardware CRTC - it's already initialized */
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                   "Using unused hardware CRTC for virtual XR output\n");
+        return crtc;
+    }
+
+    /* No unused hardware CRTC available - create a virtual CRTC */
     crtc = xf86CrtcCreate(pScrn, &drmmode_xr_virtual_crtc_funcs);
     if (!crtc) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
@@ -1424,7 +1615,8 @@ drmmode_xr_create_virtual_crtc(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
     drmmode_crtc->drmmode = drmmode;
     drmmode_crtc->mode_crtc = NULL;  /* No real DRM CRTC for virtual CRTCs */
     drmmode_crtc->vblank_pipe = 0;   /* Virtual CRTCs don't have vblank pipes */
-    drmmode_crtc->dpms_mode = DPMSModeOn;
+    /* Default to Standby to save power - will be enabled when actively consumed */
+    drmmode_crtc->dpms_mode = DPMSModeStandby;
     drmmode_crtc->cursor_up = FALSE;
     drmmode_crtc->next_msc = UINT64_MAX;
     drmmode_crtc->need_modeset = FALSE;
@@ -1442,7 +1634,7 @@ drmmode_xr_create_virtual_crtc(ScrnInfoPtr pScrn, drmmode_ptr drmmode)
     memset(drmmode_crtc->props_plane, 0, sizeof(drmmode_crtc->props_plane));
 
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-               "Created virtual XR CRTC\n");
+               "Created virtual XR CRTC (no hardware CRTC available)\n");
 
     return crtc;
 }

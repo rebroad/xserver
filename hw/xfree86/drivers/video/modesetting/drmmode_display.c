@@ -1035,6 +1035,13 @@ drmmode_crtc_flip(xf86CrtcPtr crtc, uint32_t fb_id, int x, int y,
     drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
     int ret;
 
+    /* Virtual CRTCs don't have real DRM CRTCs, so page flipping is not supported */
+    if (!drmmode_crtc->mode_crtc) {
+        xf86DrvMsg(crtc->scrn->scrnIndex, X_WARNING,
+                   "Page flip requested on virtual CRTC (not supported)\n");
+        return -1;
+    }
+
     if (ms->atomic_modeset) {
         drmModeAtomicReq *req = drmModeAtomicAlloc();
 
